@@ -32,6 +32,24 @@
  */
 #define UFFD_SHARED_FCNTL_FLAGS (O_CLOEXEC | O_NONBLOCK)
 
+struct bpf_fault_ctx {
+	/* pseudo fd refcounting */
+	refcount_t refcount;
+	/* bpf_fault config flags */
+	unsigned int flags;
+	/* released */
+	bool released;
+	/* mm with one or more vmas attached to this bpf_fault_ctx */
+	struct mm_struct *mm;
+	/* bpf program attached to this bpf_fault_ctx */
+	struct bpf_prog *prog;
+};
+static inline bool bpf_fault_set(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & VM_BPF_FAULT;
+}
+vm_fault_t handle_bpf_fault(struct vm_fault *vmf);
+
 /*
  * Start with fault_pending_wqh and fault_wqh so they're more likely
  * to be in the same cacheline.
@@ -292,6 +310,11 @@ void userfaultfd_release_all(struct mm_struct *mm,
 			     struct userfaultfd_ctx *ctx);
 
 #else /* CONFIG_USERFAULTFD */
+
+static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
+{
+	return VM_FAULT_SIGBUS;
+}
 
 /* mm helpers */
 static inline vm_fault_t handle_userfault(struct vm_fault *vmf,

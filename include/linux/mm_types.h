@@ -695,7 +695,12 @@ struct vm_region {
 #ifdef CONFIG_USERFAULTFD
 #define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) { NULL, })
 struct vm_userfaultfd_ctx {
-	struct userfaultfd_ctx *ctx;
+	union {
+		struct userfaultfd_ctx *ctx;
+#ifdef CONFIG_BPF_FAULT
+		struct bpf_fault_ctx *bpf_ctx;
+#endif
+	};
 };
 #else /* CONFIG_USERFAULTFD */
 #define NULL_VM_UFFD_CTX ((struct vm_userfaultfd_ctx) {})

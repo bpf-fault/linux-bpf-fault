@@ -1922,7 +1922,7 @@ static void userfaultfd_set_ctx(struct vm_area_struct *vma,
 				vm_flags_t vm_flags)
 {
 	vma_start_write(vma);
-	vma->vm_userfaultfd_ctx = (struct vm_userfaultfd_ctx){ctx};
+	vma->vm_userfaultfd_ctx = (struct vm_userfaultfd_ctx){{ctx}};
 	userfaultfd_set_vm_flags(vma,
 				 (vma->vm_flags & ~__VM_UFFD_FLAGS) | vm_flags);
 }
@@ -2005,7 +2005,7 @@ int userfaultfd_register_range(struct userfaultfd_ctx *ctx,
 		new_flags = (vma->vm_flags & ~__VM_UFFD_FLAGS) | vm_flags;
 		vma = vma_modify_flags_uffd(&vmi, prev, vma, start, vma_end,
 					    new_flags,
-					    (struct vm_userfaultfd_ctx){ctx},
+					    (struct vm_userfaultfd_ctx){{ctx}},
 					    /* give_up_on_oom = */false);
 		if (IS_ERR(vma))
 			return PTR_ERR(vma);
