@@ -4371,7 +4371,7 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	 * If uffd is active for the vma we need per-page fault fidelity to
 	 * maintain the uffd semantics.
 	 */
-	if (unlikely(userfaultfd_armed(vma)))
+	if (unlikely(userfaultfd_armed(vma) || bpf_fault_set(vma)))
 		goto fallback;
 
 	/*
@@ -4927,7 +4927,7 @@ static struct folio *alloc_anon_folio(struct vm_fault *vmf)
 	 * If uffd is active for the vma we need per-page fault fidelity to
 	 * maintain the uffd semantics.
 	 */
-	if (unlikely(userfaultfd_armed(vma)))
+	if (unlikely(userfaultfd_armed(vma) || bpf_fault_set(vma)))
 		goto fallback;
 
 	/*
@@ -5043,6 +5043,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			return handle_userfault(vmf, VM_UFFD_MISSING);
 		}
+		if (bpf_fault_set(vma)) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return handle_bpf_fault(vmf);
+		}
 		goto setpte;
 	}
 
@@ -5092,6 +5096,12 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(folio);
 		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+
+	if (bpf_fault_set(vma)) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		folio_put(folio);
+		return handle_bpf_fault(vmf);
 	}
 
 	folio_ref_add(folio, nr_pages - 1);
@@ -5391,7 +5401,8 @@ fallback:
 	 * approach also applies to non shmem/tmpfs faults to avoid
 	 * inflating the RSS of the process.
 	 */
-	if (!vma_is_shmem(vma) || unlikely(userfaultfd_armed(vma)) ||
+	if (!vma_is_shmem(vma) ||
+	    unlikely(userfaultfd_armed(vma) || bpf_fault_set(vma)) ||
 	    unlikely(needs_fallback)) {
 		nr_pages = 1;
 	} else if (nr_pages > 1) {
