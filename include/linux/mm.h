@@ -413,6 +413,13 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_DROPPABLE		VM_NONE
 #endif
 
+#ifdef CONFIG_BPF_FAULT
+#define VM_BPF_FAULT_BIT      43
+#define VM_BPF_FAULT          BIT(VM_BPF_FAULT_BIT)
+#else /* !CONFIG_BPF_FAULT */
+#define VM_BPF_FAULT          VM_NONE
+#endif /* CONFIG_BPF_FAULT */
+
 #ifdef CONFIG_64BIT
 #define VM_SEALED_BIT	42
 #define VM_SEALED	BIT(VM_SEALED_BIT)

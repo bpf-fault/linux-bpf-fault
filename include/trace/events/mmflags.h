@@ -200,6 +200,12 @@ IF_HAVE_PG_ARCH_3(arch_3)
 # define IF_HAVE_VM_DROPPABLE(flag, name)
 #endif
 
+#ifdef CONFIG_BPF_FAULT
+#define IF_HAVE_VM_BPF_FAULT(flag, name) {flag, name},
+#else
+#define IF_HAVE_VM_BPF_FAULT(flag, name)
+#endif
+
 #define __def_vmaflag_names						\
 	{VM_READ,			"read"		},		\
 	{VM_WRITE,			"write"		},		\
@@ -212,6 +218,7 @@ IF_HAVE_PG_ARCH_3(arch_3)
 	{VM_GROWSDOWN,			"growsdown"	},		\
 	{VM_UFFD_MISSING,		"uffd_missing"	},		\
 IF_HAVE_UFFD_MINOR(VM_UFFD_MINOR,	"uffd_minor"	)		\
+IF_HAVE_VM_BPF_FAULT(VM_BPF_FAULT,	"bpf_fault"	)		\
 	{VM_PFNMAP,			"pfnmap"	},		\
 	{VM_UFFD_WP,			"uffd_wp"	},		\
 	{VM_LOCKED,			"locked"	},		\

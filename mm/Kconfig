@@ -1278,6 +1278,13 @@ config HAVE_ARCH_USERFAULTFD_MINOR
 	help
 	  Arch has userfaultfd minor fault support
 
+config BPF_FAULT
+	bool "Enable BPF page fault handling"
+	depends on USERFAULTFD && BPF_JIT && 64BIT
+	help
+	  Enable the BPF page fault handling feature that allows BPF programs
+	  to handle page faults.
+
 menuconfig USERFAULTFD
 	bool "Enable userfaultfd() system call"
 	depends on MMU
