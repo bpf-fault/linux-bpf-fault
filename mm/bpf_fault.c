@@ -139,11 +139,10 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 
 	/* Set up BPF context and call the program */
 	ops_ctx.vmf = vmf;
-	ops_ctx.page = kaddr;
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
-	err = ops->handle_page_fault(&ops_ctx);
+	err = ops->handle_page_fault(&ops_ctx, kaddr);
 	rcu_read_unlock();
 
 	kunmap_local(kaddr);
@@ -456,6 +455,13 @@ static bool bpf_fault_is_valid_access(int off, int size,
 	if (off % size != 0)
 		return false;
 
+	/* arg1 is the page pointer: writable PTR_TO_MEM, PAGE_SIZE bounds */
+	if (off == sizeof(__u64)) {
+		info->reg_type = PTR_TO_MEM;
+		info->mem_size = PAGE_SIZE;
+		return true;
+	}
+
 	return btf_ctx_access(off, size, type, prog, info);
 }
 
@@ -529,7 +535,8 @@ static int bpf_fault_validate(void *kdata)
 	return 0;
 }
 
-static int __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx)
+static int __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
+					 unsigned char *page)
 {
 	return 0;
 }

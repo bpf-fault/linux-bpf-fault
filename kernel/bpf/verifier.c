@@ -7688,6 +7688,8 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 				}
 			}
 			regs[value_regno].type = info.reg_type;
+			if (base_type(info.reg_type) == PTR_TO_MEM)
+				regs[value_regno].mem_size = info.mem_size;
 		}
 
 	} else if (reg->type == PTR_TO_STACK) {

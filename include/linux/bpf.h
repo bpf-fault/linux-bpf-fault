@@ -1005,6 +1005,7 @@ struct bpf_insn_access_aux {
 			u32 ref_obj_id;
 		};
 	};
+	u32 mem_size;
 	struct bpf_verifier_log *log; /* for verbose logs */
 	bool is_retval; /* is accessing function return value ? */
 };

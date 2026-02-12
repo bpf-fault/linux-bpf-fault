@@ -708,12 +708,12 @@ struct vm_userfaultfd_ctx {};
 #endif /* CONFIG_USERFAULTFD */
 
 struct bpf_fault_ops_ctx {
-	struct vm_fault *vmf; // TODO: break out relevant fields
-	char *page;
+	struct vm_fault *vmf; /* TODO: break out relevant fields */
 };
 
 struct fault_ops {
-	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx);
+	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
+				 unsigned char *page);
 };
 
 struct anon_vma_name {
