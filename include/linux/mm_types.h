@@ -707,6 +707,15 @@ struct vm_userfaultfd_ctx {
 struct vm_userfaultfd_ctx {};
 #endif /* CONFIG_USERFAULTFD */
 
+struct bpf_fault_ops_ctx {
+	struct vm_fault *vmf; // TODO: break out relevant fields
+	char *page;
+};
+
+struct fault_ops {
+	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx);
+};
+
 struct anon_vma_name {
 	struct kref kref;
 	/* The name needs to be at the end because it is dynamically sized. */

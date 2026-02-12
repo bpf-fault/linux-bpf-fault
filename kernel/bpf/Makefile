@@ -43,6 +43,7 @@ ifeq ($(CONFIG_BPF_JIT),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_struct_ops.o
 obj-$(CONFIG_BPF_SYSCALL) += cpumask.o
 obj-${CONFIG_BPF_LSM} += bpf_lsm.o
+obj-${CONFIG_BPF_FAULT} += bpf_fault_ops.o
 endif
 ifneq ($(CONFIG_CRYPTO),)
 obj-$(CONFIG_BPF_SYSCALL) += crypto.o

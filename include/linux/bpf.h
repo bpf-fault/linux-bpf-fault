@@ -1986,6 +1986,8 @@ static inline void bpf_module_put(const void *data, struct module *owner)
 }
 int bpf_struct_ops_link_create(union bpf_attr *attr);
 
+int bpf_fault_ops_link_create(union bpf_attr *attr);
+
 #ifdef CONFIG_NET
 /* Define it here to avoid the use of forward declaration */
 struct bpf_dummy_ops_state {
@@ -2028,6 +2030,11 @@ static inline int bpf_struct_ops_map_sys_lookup_elem(struct bpf_map *map,
 	return -EINVAL;
 }
 static inline int bpf_struct_ops_link_create(union bpf_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int bpf_fault_ops_link_create(union bpf_attr *attr)
 {
 	return -EOPNOTSUPP;
 }

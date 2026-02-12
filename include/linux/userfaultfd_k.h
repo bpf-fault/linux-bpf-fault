@@ -41,14 +41,19 @@ struct bpf_fault_ctx {
 	bool released;
 	/* mm with one or more vmas attached to this bpf_fault_ctx */
 	struct mm_struct *mm;
-	/* bpf program attached to this bpf_fault_ctx */
-	struct bpf_prog *prog;
+	/* bpf link attached to this bpf_fault_ctx */
+	struct bpf_fault_ops_link *prog;
 };
 static inline bool bpf_fault_set(struct vm_area_struct *vma)
 {
 	return vma->vm_flags & VM_BPF_FAULT;
 }
 vm_fault_t handle_bpf_fault(struct vm_fault *vmf);
+
+struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
+struct bpf_fault_ctx *bpf_fault_ctx_alloc(void);
+void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx);
+int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 
 /*
  * Start with fault_pending_wqh and fault_wqh so they're more likely
@@ -261,6 +266,11 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 	    vma_is_shmem(vma);
 }
 
+static inline bool vma_can_bpf_fault(struct vm_area_struct *vma)
+{
+	return vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) || vma_is_shmem(vma);
+}
+
 static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
 {
 	struct userfaultfd_ctx *uffd_ctx = vma->vm_userfaultfd_ctx.ctx;
@@ -315,6 +325,13 @@ static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 {
 	return VM_FAULT_SIGBUS;
 }
+
+static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
+{
+	return NULL;
+}
+
+static inline void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx) {}
 
 /* mm helpers */
 static inline vm_fault_t handle_userfault(struct vm_fault *vmf,
