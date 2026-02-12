@@ -540,6 +540,10 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 		jsonw_uint_field(json_wtr, "map_id",
 				 info->struct_ops.map_id);
 		break;
+	case BPF_LINK_TYPE_FAULT_OPS:
+		jsonw_uint_field(json_wtr, "map_id",
+				 info->fault_ops.map_id);
+		break;
 	case BPF_LINK_TYPE_KPROBE_MULTI:
 		show_kprobe_multi_json(info, json_wtr);
 		break;
@@ -598,7 +602,8 @@ static void show_link_header_plain(struct bpf_link_info *info)
 	else
 		printf("type %u  ", info->type);
 
-	if (info->type == BPF_LINK_TYPE_STRUCT_OPS)
+	if (info->type == BPF_LINK_TYPE_STRUCT_OPS ||
+	    info->type == BPF_LINK_TYPE_FAULT_OPS)
 		printf("map %u  ", info->struct_ops.map_id);
 	else
 		printf("prog %u  ", info->prog_id);
