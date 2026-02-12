@@ -1133,6 +1133,7 @@ enum bpf_attach_type {
 	BPF_NETKIT_PEER,
 	BPF_TRACE_KPROBE_SESSION,
 	BPF_TRACE_UPROBE_SESSION,
+	BPF_FAULT_OPS,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1157,6 +1158,7 @@ enum bpf_link_type {
 	BPF_LINK_TYPE_UPROBE_MULTI = 12,
 	BPF_LINK_TYPE_NETKIT = 13,
 	BPF_LINK_TYPE_SOCKMAP = 14,
+	BPF_LINK_TYPE_FAULT_OPS = 15,
 	__MAX_BPF_LINK_TYPE,
 };
 
@@ -1819,6 +1821,11 @@ union bpf_attr {
 				};
 				__u64		expected_revision;
 			} cgroup;
+			struct {
+				__aligned_u64	start;
+				__aligned_u64	len;
+				__u32		flags;
+			} fault;
 		};
 	} link_create;
 
@@ -6801,6 +6808,9 @@ struct bpf_link_info {
 			__u32 map_id;
 			__u32 attach_type;
 		} sockmap;
+		struct {
+			__u32 map_id;
+		} fault_ops;
 	};
 } __attribute__((aligned(8)));
 

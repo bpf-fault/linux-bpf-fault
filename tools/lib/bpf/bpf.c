@@ -881,6 +881,13 @@ int bpf_link_create(int prog_fd, int target_fd,
 		if (!OPTS_ZEROED(opts, cgroup))
 			return libbpf_err(-EINVAL);
 		break;
+	case BPF_FAULT_OPS:
+		attr.link_create.fault.start = ptr_to_u64(OPTS_GET(opts, fault.start, 0));
+		attr.link_create.fault.len = OPTS_GET(opts, fault.len, 0);
+		attr.link_create.fault.flags = OPTS_GET(opts, fault.flags, 0);
+		if (!OPTS_ZEROED(opts, fault))
+			return libbpf_err(-EINVAL);
+		break;
 	default:
 		if (!OPTS_ZEROED(opts, flags))
 			return libbpf_err(-EINVAL);

@@ -443,6 +443,11 @@ struct bpf_link_create_opts {
 			__u32 relative_id;
 			__u64 expected_revision;
 		} cgroup;
+		struct {
+			void *start;
+			__u64 len;
+			__u32 flags;
+		} fault;
 	};
 	size_t :0;
 };
