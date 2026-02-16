@@ -507,6 +507,77 @@ static int bpf_fault_ops_init(struct btf *btf)
 	return 0;
 }
 
+static struct vm_area_struct *bpf_fault_clear_vma(struct vma_iterator *vmi,
+						  struct vm_area_struct *prev,
+						  struct vm_area_struct *vma,
+						  unsigned long start,
+						  unsigned long end)
+{
+	struct vm_area_struct *ret;
+	bool give_up_on_oom = false;
+
+	if (start == vma->vm_start && end == vma->vm_end)
+		give_up_on_oom = true;
+
+	ret = vma_modify_flags_uffd(vmi, prev, vma, start, end,
+				    vma->vm_flags & ~VM_BPF_FAULT,
+				    NULL_VM_UFFD_CTX, give_up_on_oom);
+
+	/*
+	 * In the vma_merge() successful mprotect-like case 8:
+	 * the next vma was merged into the current one and
+	 * the current one has not been updated yet.
+	 */
+	if (!IS_ERR(ret)) {
+		vma_start_write(ret);
+		ret->vm_userfaultfd_ctx.bpf_ctx = NULL;
+		vm_flags_reset(ret, ret->vm_flags & ~VM_BPF_FAULT);
+	}
+
+	return ret;
+}
+
+void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
+{
+	struct mm_struct *mm;
+
+	if (!ctx)
+		return;
+
+	mm = ctx->mm;
+	struct vm_area_struct *vma, *prev;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	WRITE_ONCE(ctx->released, true);
+
+	if (!mmget_not_zero(mm))
+		return;
+
+	/*
+	 * Flush page faults out of all CPUs. All page faults must be
+	 * retried without returning VM_FAULT_SIGBUS if bpf_fault_ctx_get()
+	 * succeeds but vma->vm_userfaultfd_ctx changes while
+	 * handle_bpf_fault released the mmap_lock. So it's critical that
+	 * released is set to true (above), before taking the mmap_lock
+	 * for writing.
+	 */
+	mmap_write_lock(mm);
+	prev = NULL;
+	for_each_vma(vmi, vma) {
+		cond_resched();
+		if (vma->vm_userfaultfd_ctx.bpf_ctx != ctx) {
+			prev = vma;
+			continue;
+		}
+
+		vma = bpf_fault_clear_vma(&vmi, prev, vma,
+					  vma->vm_start, vma->vm_end);
+		prev = vma;
+	}
+	mmap_write_unlock(mm);
+	mmput(mm);
+}
+
 static int bpf_fault_reg(void *kdata, struct bpf_link *link)
 {
 	return 0;

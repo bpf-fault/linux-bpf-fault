@@ -54,6 +54,7 @@ struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
 struct bpf_fault_ctx *bpf_fault_ctx_alloc(void);
 void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx);
 int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
+void bpf_fault_release_all(struct bpf_fault_ctx *ctx);
 
 /*
  * Start with fault_pending_wqh and fault_wqh so they're more likely
