@@ -12,9 +12,11 @@
 #include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/memcontrol.h>
+#include <linux/mmap_lock.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/pagemap.h>
+#include <linux/rmap.h>
 #include <linux/slab.h>
 #include <linux/userfaultfd_k.h>
 
@@ -39,6 +41,88 @@ static pmd_t *bpf_fault_alloc_pmd(struct mm_struct *mm, unsigned long address)
 		return NULL;
 	return pmd_alloc(mm, pud, address);
 }
+
+/*
+ * Lock a VMA for PTE installation.  Mirrors userfaultfd's uffd_lock_vma():
+ * try the per-VMA lock first for scalability, falling back to mmap_read_lock
+ * when anon_vma needs to be allocated or per-VMA locking fails.
+ *
+ * On success, returns the VMA with appropriate lock held.
+ * Caller must use bpf_fault_unlock_vma() to release.
+ */
+#ifdef CONFIG_PER_VMA_LOCK
+
+static struct vm_area_struct *bpf_fault_lock_vma(struct mm_struct *mm,
+						 unsigned long address)
+{
+	struct vm_area_struct *vma;
+
+	vma = lock_vma_under_rcu(mm, address);
+	if (vma) {
+		/*
+		 * We need anon_vma for folio_add_new_anon_rmap().  If it
+		 * is not yet allocated, fall back to mmap_read_lock so
+		 * anon_vma_prepare() can safely allocate it.
+		 */
+		if (!(vma->vm_flags & VM_SHARED) && unlikely(!vma->anon_vma))
+			vma_end_read(vma);
+		else
+			return vma;
+	}
+
+	mmap_read_lock(mm);
+	vma = vma_lookup(mm, address);
+	if (!vma) {
+		mmap_read_unlock(mm);
+		return ERR_PTR(-ENOENT);
+	}
+
+	if (!(vma->vm_flags & VM_SHARED) && unlikely(anon_vma_prepare(vma))) {
+		mmap_read_unlock(mm);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	if (!vma_start_read_locked(vma)) {
+		mmap_read_unlock(mm);
+		return ERR_PTR(-EAGAIN);
+	}
+	mmap_read_unlock(mm);
+	return vma;
+}
+
+static void bpf_fault_unlock_vma(struct vm_area_struct *vma)
+{
+	vma_end_read(vma);
+}
+
+#else /* !CONFIG_PER_VMA_LOCK */
+
+static struct vm_area_struct *bpf_fault_lock_vma(struct mm_struct *mm,
+						 unsigned long address)
+{
+	struct vm_area_struct *vma;
+
+	mmap_read_lock(mm);
+	vma = vma_lookup(mm, address);
+	if (!vma) {
+		mmap_read_unlock(mm);
+		return ERR_PTR(-ENOENT);
+	}
+
+	if (!(vma->vm_flags & VM_SHARED) && unlikely(anon_vma_prepare(vma))) {
+		mmap_read_unlock(mm);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	return vma;
+}
+
+static void bpf_fault_unlock_vma(struct vm_area_struct *vma)
+{
+	mmap_read_unlock(vma->vm_mm);
+}
+
+#endif /* CONFIG_PER_VMA_LOCK */
 
 static void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx)
 {
@@ -162,13 +246,21 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	__folio_mark_uptodate(folio);
 
 	/*
-	 * Re-acquire the mmap read lock to install the PTE.
-	 * The VMA must be re-validated since it may have changed.
+	 * Re-acquire a lock to install the PTE.  bpf_fault_lock_vma()
+	 * uses per-VMA locking when available for scalability, falling
+	 * back to mmap_read_lock.  It also ensures anon_vma is allocated
+	 * (required by folio_add_new_anon_rmap's BUG_ON(!anon_vma)).
 	 */
-	mmap_read_lock(mm);
+	vma = bpf_fault_lock_vma(mm, address);
+	if (IS_ERR(vma)) {
+		if (PTR_ERR(vma) == -ENOMEM)
+			ret = VM_FAULT_OOM;
+		else
+			ret = VM_FAULT_RETRY;
+		goto out_put_folio;
+	}
 
-	vma = vma_lookup(mm, address);
-	if (!vma || !bpf_fault_set(vma)) {
+	if (!bpf_fault_set(vma)) {
 		ret = VM_FAULT_SIGBUS;
 		goto out_unlock;
 	}
@@ -203,10 +295,15 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 		goto out_unlock;
 	}
 
+	if (unlikely(pmd_bad(dst_pmdval))) {
+		ret = VM_FAULT_SIGBUS;
+		goto out_unlock;
+	}
+
 	err = mfill_atomic_install_pte(dst_pmd, vma, address,
 				       &folio->page, true, 0);
 
-	mmap_read_unlock(mm);
+	bpf_fault_unlock_vma(vma);
 
 	if (err)
 		folio_put(folio);
@@ -221,7 +318,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	return ret;
 
 out_unlock:
-	mmap_read_unlock(mm);
+	bpf_fault_unlock_vma(vma);
 out_put_folio:
 	folio_put(folio);
 out_put_ctx:
