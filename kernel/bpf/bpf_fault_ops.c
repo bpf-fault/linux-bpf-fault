@@ -151,6 +151,9 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 	struct bpf_map *map;
 	int err;
 
+	if (attr->link_create.fault.flags)
+		return -EINVAL;
+
 	map = bpf_map_get(attr->link_create.map_fd);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
