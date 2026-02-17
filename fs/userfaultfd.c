@@ -618,6 +618,20 @@ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
 	struct userfaultfd_ctx *ctx = NULL, *octx;
 	struct userfaultfd_fork_ctx *fctx;
 
+	/*
+	 * TODO: implement bpf_fault inheritance on fork.  For now,
+	 * strip VM_BPF_FAULT from child VMAs to avoid type-confusing
+	 * the bpf_fault_ctx pointer with a userfaultfd_ctx pointer
+	 * and to prevent the child from faulting against a context
+	 * bound to the parent mm.
+	 */
+	if (vma->vm_flags & VM_BPF_FAULT) {
+		vma_start_write(vma);
+		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
+		vm_flags_clear(vma, VM_BPF_FAULT);
+		return 0;
+	}
+
 	octx = vma->vm_userfaultfd_ctx.ctx;
 	if (!octx)
 		return 0;
