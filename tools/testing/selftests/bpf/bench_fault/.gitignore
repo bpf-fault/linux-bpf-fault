@@ -1,0 +1,5 @@
+/bench_fault
+/*.bpf.o
+/*.skel.h
+/vmlinux.h
+/build/
