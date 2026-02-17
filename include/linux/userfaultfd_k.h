@@ -275,7 +275,13 @@ static inline bool vma_can_bpf_fault(struct vm_area_struct *vma)
 
 static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
 {
-	struct userfaultfd_ctx *uffd_ctx = vma->vm_userfaultfd_ctx.ctx;
+	struct userfaultfd_ctx *uffd_ctx;
+
+	/* bpf_fault VMAs share the union; don't type-confuse the pointer. */
+	if (vma->vm_flags & VM_BPF_FAULT)
+		return false;
+
+	uffd_ctx = vma->vm_userfaultfd_ctx.ctx;
 
 	return uffd_ctx && (uffd_ctx->features & UFFD_FEATURE_EVENT_REMAP) == 0;
 }

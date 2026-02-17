@@ -737,6 +737,18 @@ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
 {
 	struct userfaultfd_ctx *ctx;
 
+	/*
+	 * TODO: implement bpf_fault mremap notification.  For now,
+	 * strip VM_BPF_FAULT from remapped VMAs to avoid type
+	 * confusion with userfaultfd_ctx.
+	 */
+	if (vma->vm_flags & VM_BPF_FAULT) {
+		vma_start_write(vma);
+		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
+		vm_flags_clear(vma, VM_BPF_FAULT);
+		return;
+	}
+
 	ctx = vma->vm_userfaultfd_ctx.ctx;
 
 	if (!ctx)
@@ -791,6 +803,10 @@ bool userfaultfd_remove(struct vm_area_struct *vma,
 	struct userfaultfd_ctx *ctx;
 	struct userfaultfd_wait_queue ewq;
 
+	/* TODO: implement bpf_fault remove notification. */
+	if (vma->vm_flags & VM_BPF_FAULT)
+		return true;
+
 	ctx = vma->vm_userfaultfd_ctx.ctx;
 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_REMOVE))
 		return true;
@@ -829,7 +845,13 @@ int userfaultfd_unmap_prep(struct vm_area_struct *vma, unsigned long start,
 			   unsigned long end, struct list_head *unmaps)
 {
 	struct userfaultfd_unmap_ctx *unmap_ctx;
-	struct userfaultfd_ctx *ctx = vma->vm_userfaultfd_ctx.ctx;
+	struct userfaultfd_ctx *ctx;
+
+	/* TODO: implement bpf_fault unmap notification. */
+	if (vma->vm_flags & VM_BPF_FAULT)
+		return 0;
+
+	ctx = vma->vm_userfaultfd_ctx.ctx;
 
 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_UNMAP) ||
 	    has_unmap_ctx(ctx, unmaps, start, end))
