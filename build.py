@@ -65,6 +65,7 @@ def add_bpf_fault_config_options():
         "CONFIG_PTE_MARKER_UFFD_WP": "y",
         "CONFIG_BPF": "y",
         "CONFIG_BPF_JIT": "y",
+        "CONFIG_DEBUG_INFO_REDUCED": "n",
         "CONFIG_DEBUG_INFO_BTF": "y",
         "CONFIG_BPF_FAULT": "y",
     }
