@@ -129,7 +129,7 @@ static void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx)
 	refcount_inc(&ctx->refcount);
 }
 
-static void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
+void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
 {
 	if (refcount_dec_and_test(&ctx->refcount))
 		bpf_fault_ctx_free(ctx);
