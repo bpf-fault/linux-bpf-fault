@@ -205,6 +205,9 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 				 attr->link_create.fault.start,
 				 attr->link_create.fault.len);
 	if (err) {
+		/* Undo reg() — dealloc won't call unreg since map isn't set. */
+		st_map->st_ops_desc->st_ops->unreg(st_map->kvalue.data,
+						    &link->link);
 		bpf_link_cleanup(&link_primer);
 		link = NULL;
 		goto err_out;
