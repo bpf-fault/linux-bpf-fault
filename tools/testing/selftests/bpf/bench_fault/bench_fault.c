@@ -207,6 +207,7 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size)
 		perror("mmap");
 		return;
 	}
+	// madvise(region, region_size, MADV_NOHUGEPAGE);
 
 	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
 	if (uffd < 0) {
@@ -323,10 +324,10 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 	struct rusage ru_before, ru_after;
 	struct rusage_delta rd;
 
-	fprintf(stderr, "=== bpf_fault benchmark ===\n");
-	fprintf(stderr, "  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
+	printf("=== bpf_fault benchmark ===\n");
+	printf("  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
 	       num_pages, page_size, region_size);
-	fflush(stderr);
+	fflush(stdout);
 
 	fault_latencies = calloc(num_pages, sizeof(uint64_t));
 
@@ -339,6 +340,7 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 		perror("mmap");
 		return;
 	}
+	// madvise(region, region_size, MADV_NOHUGEPAGE);
 
 	fprintf(stderr, "  [dbg] opening BPF skeleton...\n");
 	fflush(stderr);
@@ -401,12 +403,12 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 		if (p[0] != FILL_BYTE) {
 			errors++;
 			if (errors <= 3)
-				fprintf(stderr, "  page %zu: got 0x%02x expected 0x%02x\n",
+				printf("  page %zu: got 0x%02x expected 0x%02x\n",
 					i, p[0], FILL_BYTE);
 		}
 	}
 	if (errors)
-		fprintf(stderr, "  VERIFICATION FAILED: %d pages wrong\n", errors);
+		printf("  VERIFICATION FAILED: %d pages wrong\n", errors);
 	else
 		printf("  Verification: OK\n");
 
