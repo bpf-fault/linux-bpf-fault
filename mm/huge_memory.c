@@ -1249,6 +1249,10 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 			VM_BUG_ON(ret & VM_FAULT_FALLBACK);
 			return ret;
 		}
+		if (bpf_fault_set(vma)) {
+			ret = VM_FAULT_FALLBACK;
+			goto unlock_release;
+		}
 		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
 		map_anon_folio_pmd(folio, vmf->pmd, vma, haddr);
 		mm_inc_nr_ptes(vma->vm_mm);
@@ -1355,6 +1359,10 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 				pte_free(vma->vm_mm, pgtable);
 				ret = handle_userfault(vmf, VM_UFFD_MISSING);
 				VM_BUG_ON(ret & VM_FAULT_FALLBACK);
+			} else if (bpf_fault_set(vma)) {
+				spin_unlock(vmf->ptl);
+				pte_free(vma->vm_mm, pgtable);
+				ret = VM_FAULT_FALLBACK;
 			} else {
 				set_huge_zero_folio(pgtable, vma->vm_mm, vma,
 						   haddr, vmf->pmd, zero_folio);

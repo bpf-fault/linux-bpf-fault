@@ -567,6 +567,7 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 				is_zero_pfn(pte_pfn(pteval)))) {
 			++none_or_zero;
 			if (!userfaultfd_armed(vma) &&
+			    !bpf_fault_set(vma) &&
 			    (!cc->is_khugepaged ||
 			     none_or_zero <= khugepaged_max_ptes_none)) {
 				continue;
@@ -1324,6 +1325,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
 			++none_or_zero;
 			if (!userfaultfd_armed(vma) &&
+			    !bpf_fault_set(vma) &&
 			    (!cc->is_khugepaged ||
 			     none_or_zero <= khugepaged_max_ptes_none)) {
 				continue;
@@ -1612,7 +1614,8 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
 	 * So page lock of folio does not protect from it, so we must not drop
 	 * ptl before pgt_pmd is removed, so uffd private needs pml taken now.
 	 */
-	if (userfaultfd_armed(vma) && !(vma->vm_flags & VM_SHARED))
+	if ((userfaultfd_armed(vma) || bpf_fault_set(vma)) &&
+	    !(vma->vm_flags & VM_SHARED))
 		pml = pmd_lock(mm, pmd);
 
 	start_pte = pte_offset_map_rw_nolock(mm, pmd, haddr, &pgt_pmd, &ptl);
