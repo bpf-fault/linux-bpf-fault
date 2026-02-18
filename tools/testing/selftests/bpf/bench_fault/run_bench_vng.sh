@@ -23,7 +23,7 @@ VMLINUX="$KDIR/vmlinux"
 # Defaults
 NUM_PAGES=1024
 ROUNDS=3
-BENCH_MODE="both"
+BENCH_MODE="all"
 MEMORY="2G"
 SKIP_BUILD=false
 
@@ -34,7 +34,7 @@ usage() {
 	Options:
 	  -n NUM_PAGES   Number of pages to fault (default: $NUM_PAGES)
 	  -r ROUNDS      Number of rounds (default: $ROUNDS)
-	  -b MODE        Benchmark mode: uffd, bpf, or both (default: $BENCH_MODE)
+	  -b MODE        Benchmark mode: uffd, bpf, baseline, or all (default: $BENCH_MODE)
 	  -m MEMORY      Guest memory size (default: $MEMORY)
 	  -s             Skip kernel and benchmark build (use existing binaries)
 	  -h             Show this help
@@ -63,8 +63,8 @@ command -v vng >/dev/null 2>&1 || die "virtme-ng (vng) not found in PATH"
 command -v clang >/dev/null 2>&1 || die "clang not found in PATH"
 
 case "$BENCH_MODE" in
-uffd|bpf|both) ;;
-*) die "Invalid benchmark mode '$BENCH_MODE'. Use: uffd, bpf, or both" ;;
+uffd|bpf|baseline|all) ;;
+*) die "Invalid benchmark mode '$BENCH_MODE'. Use: uffd, bpf, baseline, or all" ;;
 esac
 
 # --- Step 1: Build the kernel ---
