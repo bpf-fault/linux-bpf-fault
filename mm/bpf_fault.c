@@ -184,7 +184,8 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	release_fault_lock(vmf);
 
 	/* Set up BPF context and call the WP fault handler */
-	ops_ctx.vmf = vmf;
+	ops_ctx.address = vmf->address;
+	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_WP;
 
 	rcu_read_lock();
@@ -360,7 +361,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	}
 
 	/* Set up BPF context and call the program */
-	ops_ctx.vmf = vmf;
+	ops_ctx.address = vmf->address;
+	ops_ctx.real_address = vmf->real_address;
 	ops_ctx.fault_type = BPF_FAULT_MISSING;
 
 	rcu_read_lock();

@@ -714,8 +714,9 @@ enum {
 };
 
 struct bpf_fault_ops_ctx {
-	struct vm_fault *vmf; /* TODO: break out relevant fields */
-	__u32 fault_type;     /* BPF_FAULT_MISSING or BPF_FAULT_WP */
+	unsigned long address;      /* faulting virtual address - page aligned */
+	unsigned long real_address; /* faulting virtual address - exact */
+	__u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
 };
 
 struct fault_ops {
