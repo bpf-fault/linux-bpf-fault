@@ -5557,6 +5557,9 @@ static inline bool should_fault_around(struct vm_fault *vmf)
 	if (uffd_disable_fault_around(vmf->vma))
 		return false;
 
+	if (bpf_fault_set(vmf->vma))
+		return false;
+
 	/* A single page implies no faulting 'around' at all. */
 	return fault_around_pages > 1;
 }

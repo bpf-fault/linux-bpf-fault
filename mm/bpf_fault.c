@@ -221,6 +221,24 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	/* Map the folio into kernel space for the BPF program */
 	kaddr = kmap_local_folio(folio, 0);
 
+	/*
+	 * For shmem/file-backed VMAs, pre-populate the page with existing
+	 * page cache contents so the BPF program sees the actual data.
+	 * vm_file holds a reference keeping inode/mapping alive even after
+	 * mmap_lock is dropped.
+	 */
+	if (vma->vm_ops) {
+		struct inode *inode = file_inode(vma->vm_file);
+		struct folio *src;
+
+		src = filemap_lock_folio(inode->i_mapping, vmf->pgoff);
+		if (!IS_ERR(src)) {
+			memcpy_from_folio(kaddr, src, 0, PAGE_SIZE);
+			folio_unlock(src);
+			folio_put(src);
+		}
+	}
+
 	/* Set up BPF context and call the program */
 	ops_ctx.vmf = vmf;
 
@@ -432,6 +450,10 @@ int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
 
 		ret = -EINVAL;
 		if (!vma_can_bpf_fault(cur))
+			goto out_unlock;
+
+		/* Shared shmem not yet supported (needs file rmap). */
+		if (vma_is_shmem(cur) && (cur->vm_flags & VM_SHARED))
 			goto out_unlock;
 
 		/*
