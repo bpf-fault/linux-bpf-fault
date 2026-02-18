@@ -2,6 +2,8 @@
 /bench_fault_scale
 /bench_fault_shmem
 /test_shmem_fault
+/test_wp_fault
+/bench_wp_fault
 /*.bpf.o
 /*.skel.h
 /vmlinux.h

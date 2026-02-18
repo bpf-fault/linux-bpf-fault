@@ -974,6 +974,7 @@ enum bpf_cmd {
 	BPF_PROG_BIND_MAP,
 	BPF_TOKEN_CREATE,
 	BPF_PROG_STREAM_READ_BY_FD,
+	BPF_LINK_WRITEPROTECT,
 	__MAX_BPF_CMD,
 };
 
@@ -1163,6 +1164,9 @@ enum bpf_link_type {
 };
 
 #define MAX_BPF_LINK_TYPE __MAX_BPF_LINK_TYPE
+
+/* Flags for BPF_LINK_CREATE with BPF_LINK_TYPE_FAULT_OPS */
+#define BPF_FAULT_FLAG_WP	(1U << 0)
 
 enum bpf_perf_event_type {
 	BPF_PERF_EVENT_UNSPEC = 0,
@@ -1881,7 +1885,17 @@ union bpf_attr {
 		__u32		prog_fd;
 	} prog_stream_read;
 
+	struct { /* struct used by BPF_LINK_WRITEPROTECT command */
+		__u32		link_fd;
+		__u32		flags;	/* BPF_FAULT_WP_ENABLE or 0 to resolve */
+		__aligned_u64	start;
+		__aligned_u64	len;
+	} link_writeprotect;
+
 } __attribute__((aligned(8)));
+
+/* Flags for BPF_LINK_WRITEPROTECT */
+#define BPF_FAULT_WP_ENABLE	(1U << 0)
 
 /* The description below is an attempt at providing documentation to eBPF
  * developers about the multiple available eBPF helper functions. It can be
