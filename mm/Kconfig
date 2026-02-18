@@ -1280,7 +1280,7 @@ config HAVE_ARCH_USERFAULTFD_MINOR
 
 config BPF_FAULT
 	bool "Enable BPF page fault handling"
-	depends on USERFAULTFD && BPF_JIT && 64BIT
+	depends on USERFAULTFD && BPF_JIT && BPF_SYSCALL && 64BIT
 	help
 	  Enable the BPF page fault handling feature that allows BPF programs
 	  to handle page faults.

@@ -56,14 +56,21 @@ def edit_config_file(config_options: Dict[str, str], path=".config"):
         elif action == "n":
             run(["./scripts/config", "-d", config_opt])
         else:
+            # TODO: add support for --set-str
             raise ValueError(f"Invalid action {action} for config option {config_opt}")
 
 
 def add_bpf_fault_config_options():
+    # For Cloudlab need:
+    #   CONFIG_NETFILTER=y
+    #   CONFIG_SATA_AHCI=m
+    #
+    # And generally need CONFIG_SYSTEM_REVOCATION_KEYS=""
     config_options = {
         "CONFIG_USERFAULTFD": "y",
         "CONFIG_PTE_MARKER_UFFD_WP": "y",
         "CONFIG_BPF": "y",
+        "CONFIG_BPF_SYSCALL": "y",
         "CONFIG_BPF_JIT": "y",
         "CONFIG_DEBUG_INFO_REDUCED": "n",
         "CONFIG_DEBUG_INFO_BTF": "y",
