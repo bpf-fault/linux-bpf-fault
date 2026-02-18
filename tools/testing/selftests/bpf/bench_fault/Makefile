@@ -22,7 +22,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
-all: bench_fault
+all: bench_fault bench_fault_scale
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -49,11 +49,14 @@ fault_ops.bpf.o: fault_ops.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
 fault_ops.skel.h: fault_ops.bpf.o $(BPFTOOL)
 	$(BPFTOOL) gen skeleton $< > $@
 
-# Compile the userspace benchmark
+# Compile the userspace benchmarks
 bench_fault: bench_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+bench_fault_scale: bench_fault_scale.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
 clean:
-	rm -rf bench_fault fault_ops.bpf.o fault_ops.skel.h vmlinux.h $(BUILD_DIR)
+	rm -rf bench_fault bench_fault_scale fault_ops.bpf.o fault_ops.skel.h vmlinux.h $(BUILD_DIR)
 
 .PHONY: all clean

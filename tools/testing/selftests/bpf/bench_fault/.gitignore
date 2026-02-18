@@ -1,4 +1,5 @@
 /bench_fault
+/bench_fault_scale
 /*.bpf.o
 /*.skel.h
 /vmlinux.h
