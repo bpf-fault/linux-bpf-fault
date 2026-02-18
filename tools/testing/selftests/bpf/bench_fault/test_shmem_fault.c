@@ -426,9 +426,186 @@ out:
 	return ret;
 }
 
+/*
+ * Test 5: bpf_fault on shmem with large folios (THP).
+ *
+ * When CONFIG_TRANSPARENT_HUGEPAGE is enabled and the shmem page cache
+ * contains large folios, filemap_lock_folio() can return a folio whose
+ * folio->index is less than vmf->pgoff.  The kernel must compute the
+ * correct sub-page offset within the large folio when pre-populating
+ * the page for the BPF program.
+ *
+ * This test writes distinct per-page patterns into a tmpfs file, uses
+ * MADV_HUGEPAGE to encourage large folio creation, then faults pages
+ * through bpf_fault.  We verify:
+ *   1. No crashes or kernel warnings (the main regression this catches)
+ *   2. All faulted pages contain the BPF fill byte ('A')
+ *   3. A control MAP_PRIVATE read (no bpf_fault) sees correct per-page
+ *      data, confirming the page cache contents are right.
+ */
+static int test_large_folio(void)
+{
+	/*
+	 * Use 512 pages (2MB) — the common PMD-size THP boundary.
+	 * Even if the system doesn't create a single 2MB folio, the
+	 * kernel may still create intermediate-order folios (64K, etc).
+	 */
+	const size_t num_pages = 512;
+	const size_t region_size = num_pages * page_size;
+	char path[256];
+	struct fault_ops_bpf *skel = NULL;
+	struct bpf_link *link = NULL;
+	void *region = MAP_FAILED;
+	void *control = MAP_FAILED;
+	int fd = -1;
+	int ret = -1;
+
+	printf("TEST: large folio (THP) shmem ... ");
+	fflush(stdout);
+
+	snprintf(path, sizeof(path), "%s/bpf_fault_test_thp.XXXXXX",
+		 find_tmpfs());
+	fd = mkstemp(path);
+	if (fd < 0) {
+		perror("mkstemp");
+		goto out;
+	}
+
+	/*
+	 * Write a distinct byte pattern per page so we can verify the
+	 * page cache returns the right sub-page data.
+	 */
+	for (size_t i = 0; i < num_pages; i++) {
+		char buf[4096];
+		unsigned char pattern = (unsigned char)(i & 0xff);
+
+		memset(buf, pattern, sizeof(buf));
+		if (write(fd, buf, page_size) != page_size) {
+			perror("write");
+			goto out;
+		}
+	}
+
+	/*
+	 * Populate the page cache with large folios by mapping shared,
+	 * advising MADV_HUGEPAGE, faulting in all pages, then unmapping.
+	 * This is best-effort — THP may not be available or the kernel
+	 * may choose smaller folios.  The test is still valid either way.
+	 */
+	{
+		void *shared;
+
+		shared = mmap(NULL, region_size, PROT_READ,
+			      MAP_SHARED | MAP_POPULATE, fd, 0);
+		if (shared != MAP_FAILED) {
+			madvise(shared, region_size, MADV_HUGEPAGE);
+			/* Touch each page to ensure population */
+			for (size_t i = 0; i < num_pages; i++) {
+				volatile char *p = (volatile char *)shared +
+						   i * page_size;
+				(void)*p;
+			}
+			munmap(shared, region_size);
+		}
+	}
+
+	/*
+	 * Control check: MAP_PRIVATE without bpf_fault should see the
+	 * original per-page patterns from the page cache.  This proves
+	 * the page cache data is correct before we test bpf_fault.
+	 */
+	control = mmap(NULL, region_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (control == MAP_FAILED) {
+		perror("mmap control");
+		goto out;
+	}
+
+	for (size_t i = 0; i < num_pages; i++) {
+		const unsigned char *p = (const unsigned char *)control +
+					 i * page_size;
+		unsigned char expected = (unsigned char)(i & 0xff);
+
+		if (p[0] != expected) {
+			fprintf(stderr,
+				"    FAIL: control page %zu: got 0x%02x expected 0x%02x\n",
+				i, p[0], expected);
+			munmap(control, region_size);
+			goto out;
+		}
+	}
+	munmap(control, region_size);
+	control = MAP_FAILED;
+
+	/*
+	 * Now test bpf_fault with the same file.  Large folios should
+	 * still be in the page cache from the shared mapping above.
+	 */
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE, fd, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	skel = fault_ops_bpf__open_and_load();
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		goto out;
+	}
+
+	link = bpf_map__attach_fault_ops(skel->maps.bench_fault_ops,
+					 region, region_size, 0);
+	if (!link) {
+		fprintf(stderr, "Failed to attach fault_ops: %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	/*
+	 * Fault pages in a non-sequential order to increase the chance
+	 * of hitting non-zero offsets within large folios.  We fault
+	 * odd pages first, then even pages.
+	 */
+	for (size_t i = 1; i < num_pages; i += 2) {
+		volatile char *p = (volatile char *)region + i * page_size;
+		(void)*p;
+	}
+	for (size_t i = 0; i < num_pages; i += 2) {
+		volatile char *p = (volatile char *)region + i * page_size;
+		(void)*p;
+	}
+
+	/* All pages should contain FILL_BYTE from the BPF program */
+	ret = 0;
+	for (size_t i = 0; i < num_pages; i++) {
+		if (check_page(region, i, FILL_BYTE)) {
+			ret = -1;
+			break;
+		}
+	}
+
+out:
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		fault_ops_bpf__destroy(skel);
+	if (control != MAP_FAILED)
+		munmap(control, region_size);
+	if (region != MAP_FAILED)
+		munmap(region, region_size);
+	if (fd >= 0) {
+		close(fd);
+		unlink(path);
+	}
+
+	printf("%s\n", ret ? "FAIL" : "OK");
+	return ret;
+}
+
 int main(void)
 {
 	int failures = 0;
+	int total = 5;
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -442,9 +619,10 @@ int main(void)
 		failures++;
 	if (test_mixed())
 		failures++;
+	if (test_large_folio())
+		failures++;
 
-	printf("\n%d/%d tests passed\n",
-	       4 - failures, 4);
+	printf("\n%d/%d tests passed\n", total - failures, total);
 
 	return failures ? 1 : 0;
 }
