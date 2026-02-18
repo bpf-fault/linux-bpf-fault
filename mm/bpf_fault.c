@@ -173,10 +173,15 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 		goto out;
 
-	if (unlikely(READ_ONCE(ctx->released)))
+	if (unlikely(READ_ONCE(ctx->released))) {
+		release_fault_lock(vmf);
 		goto out;
+	}
 
+	/* Take the reference before dropping the fault lock */
 	bpf_fault_ctx_get(ctx);
+
+	release_fault_lock(vmf);
 
 	/* Set up BPF context and call the WP fault handler */
 	ops_ctx.vmf = vmf;

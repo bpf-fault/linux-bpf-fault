@@ -625,7 +625,7 @@ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
 	 * and to prevent the child from faulting against a context
 	 * bound to the parent mm.
 	 */
-	if (vma->vm_flags & VM_BPF_FAULT) {
+	if (vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP)) {
 		vma_start_write(vma);
 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
 		vm_flags_clear(vma, VM_BPF_FAULT | VM_BPF_FAULT_WP);
@@ -742,10 +742,10 @@ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
 	 * strip VM_BPF_FAULT from remapped VMAs to avoid type
 	 * confusion with userfaultfd_ctx.
 	 */
-	if (vma->vm_flags & VM_BPF_FAULT) {
+	if (vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP)) {
 		vma_start_write(vma);
 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
-		vm_flags_clear(vma, VM_BPF_FAULT);
+		vm_flags_clear(vma, VM_BPF_FAULT | VM_BPF_FAULT_WP);
 		return;
 	}
 
@@ -804,7 +804,7 @@ bool userfaultfd_remove(struct vm_area_struct *vma,
 	struct userfaultfd_wait_queue ewq;
 
 	/* TODO: implement bpf_fault remove notification. */
-	if (vma->vm_flags & VM_BPF_FAULT)
+	if (vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP))
 		return true;
 
 	ctx = vma->vm_userfaultfd_ctx.ctx;
@@ -848,7 +848,7 @@ int userfaultfd_unmap_prep(struct vm_area_struct *vma, unsigned long start,
 	struct userfaultfd_ctx *ctx;
 
 	/* TODO: implement bpf_fault unmap notification. */
-	if (vma->vm_flags & VM_BPF_FAULT)
+	if (vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP))
 		return 0;
 
 	ctx = vma->vm_userfaultfd_ctx.ctx;
