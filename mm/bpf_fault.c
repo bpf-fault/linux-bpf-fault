@@ -142,6 +142,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	struct address_space *mapping = NULL;
 	struct fault_ops *ops;
 	struct folio *folio = NULL;
 	unsigned long address = vmf->address;
@@ -205,6 +206,16 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	/* Take the reference before dropping the mmap_lock */
 	bpf_fault_ctx_get(ctx);
 
+	/*
+	 * Save the mapping before dropping the lock.  After
+	 * release_fault_lock() the VMA may be torn down by munmap(),
+	 * so we cannot touch vma->vm_ops or vma->vm_file afterwards.
+	 * vm_file holds a reference to the inode that keeps the
+	 * address_space alive independently of the VMA.
+	 */
+	if (vma->vm_ops && vma->vm_file)
+		mapping = vma->vm_file->f_mapping;
+
 	release_fault_lock(vmf);
 
 	/*
@@ -224,16 +235,17 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	/*
 	 * For shmem/file-backed VMAs, pre-populate the page with existing
 	 * page cache contents so the BPF program sees the actual data.
-	 * vm_file holds a reference keeping inode/mapping alive even after
-	 * mmap_lock is dropped.
+	 * We use the mapping pointer saved before release_fault_lock()
+	 * since the VMA may have been torn down by now.
 	 */
-	if (vma->vm_ops) {
-		struct inode *inode = file_inode(vma->vm_file);
+	if (mapping) {
 		struct folio *src;
 
-		src = filemap_lock_folio(inode->i_mapping, vmf->pgoff);
+		src = filemap_lock_folio(mapping, vmf->pgoff);
 		if (!IS_ERR(src)) {
-			memcpy_from_folio(kaddr, src, 0, PAGE_SIZE);
+			size_t off = offset_in_folio(src, vmf->pgoff << PAGE_SHIFT);
+
+			memcpy_from_folio(kaddr, src, off, PAGE_SIZE);
 			folio_unlock(src);
 			folio_put(src);
 		}
