@@ -1,5 +1,7 @@
 /bench_fault
 /bench_fault_scale
+/bench_fault_shmem
+/test_shmem_fault
 /*.bpf.o
 /*.skel.h
 /vmlinux.h
