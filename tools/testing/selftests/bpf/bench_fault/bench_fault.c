@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Benchmark: userfaultfd vs bpf_fault page fault handling.
+ * Benchmark: baseline vs userfaultfd vs bpf_fault page fault handling.
  *
- * Based on the userfaultfd(2) man page example.  Both paths handle
- * anonymous MISSING page faults by filling each page with 'A'.
+ * Based on the userfaultfd(2) man page example.  The uffd and bpf paths
+ * handle anonymous MISSING page faults by filling each page with 'A'.
+ * The baseline measures the kernel's default anonymous page fault path.
  *
  * Metrics captured:
  *   - Total wall-clock time
@@ -109,6 +110,93 @@ static void print_latency_stats(uint64_t *lat, size_t n)
 	printf("      p50:  %lu\n", lat[n / 2]);
 	printf("      p99:  %lu\n", lat[(size_t)(n * 0.99)]);
 	printf("      p999: %lu\n", lat[(size_t)(n * 0.999)]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  baseline benchmark (anonymous faults, no uffd/bpf)           */
+/* ------------------------------------------------------------------ */
+
+static void bench_baseline(size_t num_pages, size_t page_size)
+{
+	size_t region_size = num_pages * page_size;
+	void *region;
+	uint64_t t_start, t_setup, t_faults, t_end;
+	struct rusage ru_before, ru_after;
+	struct rusage_delta rd;
+
+	printf("=== baseline benchmark (no uffd/bpf) ===\n");
+	printf("  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
+	       num_pages, page_size, region_size);
+
+	fault_latencies = calloc(num_pages, sizeof(uint64_t));
+
+	t_start = now_ns();
+
+	/* Setup phase: just mmap */
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		free(fault_latencies);
+		return;
+	}
+
+	t_setup = now_ns();
+
+	/* Fault phase: touch each page sequentially */
+	ru_before = rusage_snap();
+
+	for (size_t i = 0; i < num_pages; i++) {
+		volatile char *p = (volatile char *)region + i * page_size;
+		uint64_t before = now_ns();
+		char c = *p;  /* trigger the fault */
+		uint64_t after = now_ns();
+		fault_latencies[i] = after - before;
+		(void)c;
+	}
+
+	ru_after = rusage_snap();
+	t_faults = now_ns();
+
+	t_end = t_faults;
+
+	/* Verify: kernel zero-fills anonymous pages */
+	int errors = 0;
+
+	for (size_t i = 0; i < num_pages; i++) {
+		unsigned char *p = (unsigned char *)region + i * page_size;
+		if (p[0] != 0) {
+			errors++;
+			if (errors <= 3)
+				fprintf(stderr, "  page %zu: got 0x%02x expected 0x00\n",
+					i, p[0]);
+		}
+	}
+	if (errors)
+		fprintf(stderr, "  VERIFICATION FAILED: %d pages wrong\n", errors);
+	else
+		printf("  Verification: OK\n");
+
+	/* Results */
+	rd = rusage_diff(&ru_before, &ru_after);
+	printf("  Timings:\n");
+	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
+	printf("    Faults:     %10.3f ms\n", (t_faults - t_setup) / 1e6);
+	printf("    Total:      %10.3f ms\n", (t_end - t_start) / 1e6);
+	printf("    Throughput: %10.0f faults/sec\n",
+	       num_pages / ((t_faults - t_setup) / 1e9));
+	printf("  Context switches:\n");
+	printf("    Voluntary:   %ld\n", rd.vol_csw);
+	printf("    Involuntary: %ld\n", rd.invol_csw);
+	printf("  Page faults:\n");
+	printf("    Minor: %ld\n", rd.minflt);
+	printf("    Major: %ld\n", rd.majflt);
+
+	print_latency_stats(fault_latencies, num_pages);
+	printf("\n");
+
+	munmap(region, region_size);
+	free(fault_latencies);
 }
 
 /* ------------------------------------------------------------------ */
@@ -448,18 +536,18 @@ out_unmap:
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s [-n num_pages] [-r rounds] [-b uffd|bpf|both]\n",
+	fprintf(stderr, "Usage: %s [-n num_pages] [-r rounds] [-b uffd|bpf|baseline|all]\n",
 		prog);
 	fprintf(stderr, "  -n  Number of pages to fault (default: 1024)\n");
 	fprintf(stderr, "  -r  Number of rounds (default: 3)\n");
-	fprintf(stderr, "  -b  Which benchmark: uffd, bpf, or both (default: both)\n");
+	fprintf(stderr, "  -b  Which benchmark: uffd, bpf, baseline, or all (default: all)\n");
 }
 
 int main(int argc, char **argv)
 {
 	size_t num_pages = 1024;
 	int rounds = 3;
-	int do_uffd = 1, do_bpf = 1;
+	int do_baseline = 1, do_uffd = 1, do_bpf = 1;
 	long page_size = sysconf(_SC_PAGESIZE);
 	int opt;
 
@@ -473,10 +561,15 @@ int main(int argc, char **argv)
 			break;
 		case 'b':
 			if (strcmp(optarg, "uffd") == 0) {
+				do_baseline = 0;
 				do_bpf = 0;
 			} else if (strcmp(optarg, "bpf") == 0) {
+				do_baseline = 0;
 				do_uffd = 0;
-			} else if (strcmp(optarg, "both") != 0) {
+			} else if (strcmp(optarg, "baseline") == 0) {
+				do_uffd = 0;
+				do_bpf = 0;
+			} else if (strcmp(optarg, "all") != 0) {
 				usage(argv[0]);
 				return 1;
 			}
@@ -494,6 +587,8 @@ int main(int argc, char **argv)
 	for (int r = 0; r < rounds; r++) {
 		printf("--- Round %d/%d ---\n\n", r + 1, rounds);
 
+		if (do_baseline)
+			bench_baseline(num_pages, page_size);
 		if (do_uffd)
 			bench_userfaultfd(num_pages, page_size);
 		if (do_bpf)
