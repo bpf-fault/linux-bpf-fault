@@ -219,6 +219,7 @@ IF_HAVE_PG_ARCH_3(arch_3)
 	{VM_UFFD_MISSING,		"uffd_missing"	},		\
 IF_HAVE_UFFD_MINOR(VM_UFFD_MINOR,	"uffd_minor"	)		\
 IF_HAVE_VM_BPF_FAULT(VM_BPF_FAULT,	"bpf_fault"	)		\
+IF_HAVE_VM_BPF_FAULT(VM_BPF_FAULT_WP,	"bpf_fault_wp"	)		\
 	{VM_PFNMAP,			"pfnmap"	},		\
 	{VM_UFFD_WP,			"uffd_wp"	},		\
 	{VM_LOCKED,			"locked"	},		\

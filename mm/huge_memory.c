@@ -1249,7 +1249,7 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 			VM_BUG_ON(ret & VM_FAULT_FALLBACK);
 			return ret;
 		}
-		if (bpf_fault_set(vma)) {
+		if (bpf_fault_missing(vma)) {
 			ret = VM_FAULT_FALLBACK;
 			goto unlock_release;
 		}
@@ -1359,7 +1359,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 				pte_free(vma->vm_mm, pgtable);
 				ret = handle_userfault(vmf, VM_UFFD_MISSING);
 				VM_BUG_ON(ret & VM_FAULT_FALLBACK);
-			} else if (bpf_fault_set(vma)) {
+			} else if (bpf_fault_missing(vma)) {
 				spin_unlock(vmf->ptl);
 				pte_free(vma->vm_mm, pgtable);
 				ret = VM_FAULT_FALLBACK;

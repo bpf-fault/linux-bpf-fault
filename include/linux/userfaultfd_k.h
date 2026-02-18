@@ -46,15 +46,34 @@ struct bpf_fault_ctx {
 };
 static inline bool bpf_fault_set(struct vm_area_struct *vma)
 {
+	return vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP);
+}
+
+static inline bool bpf_fault_missing(struct vm_area_struct *vma)
+{
 	return vma->vm_flags & VM_BPF_FAULT;
 }
+
+static inline bool bpf_fault_wp(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & VM_BPF_FAULT_WP;
+}
+
+static inline bool bpf_fault_pte_wp(struct vm_area_struct *vma, pte_t pte)
+{
+	return bpf_fault_wp(vma) && pte_uffd_wp(pte);
+}
+
 vm_fault_t handle_bpf_fault(struct vm_fault *vmf);
+vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf);
 
 struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link);
 struct bpf_fault_ctx *bpf_fault_ctx_alloc(void);
 void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx);
 void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx);
-int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
+int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 flags);
+int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
+		       unsigned long len, bool enable_wp);
 void bpf_fault_release_all(struct bpf_fault_ctx *ctx);
 
 /*
@@ -186,7 +205,7 @@ static inline bool is_mergeable_vm_userfaultfd_ctx(struct vm_area_struct *vma,
  */
 static inline bool uffd_disable_huge_pmd_share(struct vm_area_struct *vma)
 {
-	return vma->vm_flags & (VM_UFFD_WP | VM_UFFD_MINOR);
+	return vma->vm_flags & (VM_UFFD_WP | VM_UFFD_MINOR | VM_BPF_FAULT_WP);
 }
 
 /*
@@ -330,6 +349,11 @@ void userfaultfd_release_all(struct mm_struct *mm,
 #else /* CONFIG_USERFAULTFD */
 
 static inline vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
+{
+	return VM_FAULT_SIGBUS;
+}
+
+static inline vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 {
 	return VM_FAULT_SIGBUS;
 }

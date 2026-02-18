@@ -628,7 +628,7 @@ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
 	if (vma->vm_flags & VM_BPF_FAULT) {
 		vma_start_write(vma);
 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
-		vm_flags_clear(vma, VM_BPF_FAULT);
+		vm_flags_clear(vma, VM_BPF_FAULT | VM_BPF_FAULT_WP);
 		return 0;
 	}
 

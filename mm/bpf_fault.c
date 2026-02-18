@@ -8,8 +8,10 @@
 #include <linux/bpf_verifier.h>
 #include <linux/bpf.h>
 #include <linux/btf.h>
+#include <linux/btf_ids.h>
 #include <linux/highmem.h>
 #include <linux/hugetlb.h>
+#include <asm-generic/tlb.h>
 #include <linux/init.h>
 #include <linux/memcontrol.h>
 #include <linux/mmap_lock.h>
@@ -135,6 +137,107 @@ void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
 		bpf_fault_ctx_free(ctx);
 }
 
+/*
+ * Handle a write-protection fault on a bpf_fault WP-registered VMA.
+ *
+ * Called from do_wp_page() with the PTE lock already released.  The BPF
+ * program decides whether to allow the write (return 0) or deny it
+ * (return non-zero → SIGBUS).
+ *
+ * On allow: re-acquire VMA lock, re-walk page tables, clear the uffd-wp
+ * bit on the PTE, and return VM_FAULT_RETRY so the fault retries and
+ * finds the PTE writable.
+ */
+vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
+{
+	struct bpf_fault_ctx *ctx;
+	struct bpf_fault_ops_ctx ops_ctx;
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = vmf->address;
+	struct fault_ops *ops;
+	int err;
+
+	if (current->flags & (PF_EXITING | PF_DUMPCORE))
+		goto out;
+
+	ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+	if (!ctx)
+		goto out;
+
+	if (unlikely(!(vmf->flags & FAULT_FLAG_ALLOW_RETRY)))
+		goto out;
+
+	ret = VM_FAULT_RETRY;
+	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+		goto out;
+
+	if (unlikely(READ_ONCE(ctx->released)))
+		goto out;
+
+	bpf_fault_ctx_get(ctx);
+
+	/* Set up BPF context and call the WP fault handler */
+	ops_ctx.vmf = vmf;
+	ops_ctx.fault_type = BPF_FAULT_WP;
+
+	rcu_read_lock();
+	ops = bpf_fault_ops_map(ctx->prog);
+	if (ops->handle_wp_fault)
+		err = ops->handle_wp_fault(&ops_ctx);
+	else
+		err = -ENOSYS;
+	rcu_read_unlock();
+
+	if (err) {
+		ret = VM_FAULT_SIGBUS;
+		goto out_put_ctx;
+	}
+
+	/*
+	 * BPF program allowed the write.  Re-acquire a lock and clear
+	 * the uffd-wp bit on the PTE to resolve the write protection.
+	 */
+	vma = bpf_fault_lock_vma(mm, address);
+	if (IS_ERR(vma)) {
+		ret = VM_FAULT_RETRY;
+		goto out_put_ctx;
+	}
+
+	if (bpf_fault_wp(vma)) {
+		pmd_t *pmd;
+		pte_t *ptep, pte;
+		spinlock_t *ptl;
+
+		pmd = bpf_fault_alloc_pmd(mm, address);
+		if (!pmd)
+			goto out_unlock;
+
+		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+		if (!ptep)
+			goto out_unlock;
+
+		pte = ptep_get(ptep);
+		if (pte_present(pte) && pte_uffd_wp(pte)) {
+			pte = pte_clear_uffd_wp(pte);
+			set_pte_at(mm, address, ptep, pte);
+		}
+		pte_unmap_unlock(ptep, ptl);
+	}
+
+out_unlock:
+	bpf_fault_unlock_vma(vma);
+	ret = VM_FAULT_RETRY;
+
+out_put_ctx:
+	bpf_fault_ctx_put(ctx);
+	return ret;
+
+out:
+	return ret;
+}
+
 vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 {
 	struct bpf_fault_ctx *ctx;
@@ -253,6 +356,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 
 	/* Set up BPF context and call the program */
 	ops_ctx.vmf = vmf;
+	ops_ctx.fault_type = BPF_FAULT_MISSING;
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
@@ -290,7 +394,7 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 		goto out_put_folio;
 	}
 
-	if (!bpf_fault_set(vma)) {
+	if (!bpf_fault_missing(vma)) {
 		ret = VM_FAULT_SIGBUS;
 		goto out_unlock;
 	}
@@ -331,7 +435,8 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	}
 
 	err = mfill_atomic_install_pte(dst_pmd, vma, address,
-				       &folio->page, true, 0);
+				       &folio->page, true,
+				       bpf_fault_wp(vma) ? MFILL_ATOMIC_WP : 0);
 
 	bpf_fault_unlock_vma(vma);
 
@@ -413,17 +518,30 @@ static __always_inline int bpf_fault_validate_range(struct mm_struct *mm,
  * Register a VMA range for BPF fault handling.  Sets VM_BPF_FAULT on the
  * specified range, similar to how userfaultfd_register sets UFFD flags.
  */
-int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
+int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 flags)
 {
 	struct mm_struct *mm = ctx->mm;
 	struct vm_area_struct *vma, *prev, *cur;
 	int ret;
-	vm_flags_t vm_flags = VM_BPF_FAULT;
+	vm_flags_t vm_flags = 0;
 	vm_flags_t new_flags;
 	bool found;
 	unsigned long vma_end;
 	unsigned long vma_start = start;
 	unsigned long end = start + len;
+
+	/*
+	 * TODO: support combined missing + WP registrations.  This will
+	 * require a new BPF_FAULT_FLAG_MISSING so userspace can opt in
+	 * to both modes, and handle_bpf_fault() already installs PTEs
+	 * with MFILL_ATOMIC_WP when bpf_fault_wp() is set.
+	 */
+	if (flags & BPF_FAULT_FLAG_WP)
+		vm_flags |= VM_BPF_FAULT_WP;
+	else
+		vm_flags |= VM_BPF_FAULT;
+
+	ctx->flags = flags;
 	VMA_ITERATOR(vmi, mm, 0);
 
 	ret = bpf_fault_validate_range(mm, start, len);
@@ -529,7 +647,8 @@ int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
 			vma_start = vma->vm_start;
 		vma_end = min(end, vma->vm_end);
 
-		new_flags = (vma->vm_flags & ~__VM_UFFD_FLAGS) | vm_flags;
+		new_flags = (vma->vm_flags & ~(__VM_UFFD_FLAGS |
+			     VM_BPF_FAULT | VM_BPF_FAULT_WP)) | vm_flags;
 		vma = vma_modify_flags_uffd(&vmi, prev, vma,
 					    vma_start, vma_end,
 					    new_flags,
@@ -579,6 +698,9 @@ static bool bpf_fault_is_valid_access(int off, int size,
 				      const struct bpf_prog *prog,
 				      struct bpf_insn_access_aux *info)
 {
+	const char *fname = prog->aux->attach_func_name;
+	bool is_wp = fname && !strcmp(fname, "handle_wp_fault");
+
 	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
 		return false;
 	if (type != BPF_READ)
@@ -586,8 +708,12 @@ static bool bpf_fault_is_valid_access(int off, int size,
 	if (off % size != 0)
 		return false;
 
-	/* arg1 is the page pointer: writable PTR_TO_MEM, PAGE_SIZE bounds */
-	if (off == sizeof(__u64)) {
+	/*
+	 * For handle_page_fault: arg1 is the page pointer (writable
+	 * PTR_TO_MEM, PAGE_SIZE bounds).  handle_wp_fault has no
+	 * page pointer argument.
+	 */
+	if (!is_wp && off == sizeof(__u64)) {
 		info->reg_type = PTR_TO_MEM;
 		info->mem_size = PAGE_SIZE;
 		return true;
@@ -647,11 +773,19 @@ static struct vm_area_struct *bpf_fault_clear_vma(struct vma_iterator *vmi,
 	struct vm_area_struct *ret;
 	bool give_up_on_oom = false;
 
+	/*
+	 * If WP was active, resolve all write-protection markers before
+	 * clearing the VMA flags.  This is analogous to userfaultfd_clear_vma
+	 * calling uffd_wp_range(vma, ..., false).
+	 */
+	if (vma->vm_flags & VM_BPF_FAULT_WP)
+		uffd_wp_range(vma, start, end - start, false);
+
 	if (start == vma->vm_start && end == vma->vm_end)
 		give_up_on_oom = true;
 
 	ret = vma_modify_flags_uffd(vmi, prev, vma, start, end,
-				    vma->vm_flags & ~VM_BPF_FAULT,
+				    vma->vm_flags & ~(VM_BPF_FAULT | VM_BPF_FAULT_WP),
 				    NULL_VM_UFFD_CTX, give_up_on_oom);
 
 	/*
@@ -662,7 +796,7 @@ static struct vm_area_struct *bpf_fault_clear_vma(struct vma_iterator *vmi,
 	if (!IS_ERR(ret)) {
 		vma_start_write(ret);
 		ret->vm_userfaultfd_ctx.bpf_ctx = NULL;
-		vm_flags_reset(ret, ret->vm_flags & ~VM_BPF_FAULT);
+		vm_flags_reset(ret, ret->vm_flags & ~(VM_BPF_FAULT | VM_BPF_FAULT_WP));
 	}
 
 	return ret;
@@ -743,8 +877,97 @@ static int __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
 	return 0;
 }
 
+static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx)
+{
+	return 0;
+}
+
 static struct fault_ops __bpf_fault_ops = {
 	.handle_page_fault = __bpf_fault_handle_page_fault,
+	.handle_wp_fault = __bpf_fault_handle_wp_fault,
+};
+
+/*
+ * Apply or resolve write-protection on a page range registered with
+ * bpf_fault WP.  Caller must not hold the mmap lock.
+ */
+int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
+		       unsigned long len, bool enable_wp)
+{
+	unsigned long end = start + len;
+	unsigned long _start, _end;
+	struct vm_area_struct *dst_vma;
+	long err;
+	VMA_ITERATOR(vmi, mm, start);
+
+	if (bpf_fault_validate_range(mm, start, len))
+		return -EINVAL;
+
+	if (!mmget_not_zero(mm))
+		return -ESRCH;
+
+	mmap_read_lock(mm);
+
+	err = -ENOENT;
+	for_each_vma_range(vmi, dst_vma, end) {
+		unsigned int mm_cp_flags;
+		struct mmu_gather tlb;
+
+		if (!bpf_fault_wp(dst_vma)) {
+			err = -ENOENT;
+			break;
+		}
+
+		_start = max(dst_vma->vm_start, start);
+		_end = min(dst_vma->vm_end, end);
+
+		if (enable_wp)
+			mm_cp_flags = MM_CP_UFFD_WP;
+		else
+			mm_cp_flags = MM_CP_UFFD_WP_RESOLVE;
+
+		if (!enable_wp &&
+		    vma_wants_manual_pte_write_upgrade(dst_vma))
+			mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
+
+		tlb_gather_mmu(&tlb, mm);
+		err = change_protection(&tlb, dst_vma, _start, _end, mm_cp_flags);
+		tlb_finish_mmu(&tlb);
+
+		if (err < 0)
+			break;
+		err = 0;
+	}
+
+	mmap_read_unlock(mm);
+	mmput(mm);
+	return err;
+}
+
+/*
+ * BPF kfunc: apply or resolve write-protection on a page range.
+ *
+ * Called from a BPF struct_ops fault handler.  The faulting task's mmap
+ * lock is not held on entry (handle_bpf_fault releases it before calling
+ * the BPF program).
+ */
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc int bpf_fault_writeprotect(struct bpf_fault_ops_ctx *ctx,
+					__u64 start, __u64 len, bool enable_wp)
+{
+	return bpf_fault_wp_range(current->mm, start, len, enable_wp);
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(bpf_fault_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_fault_writeprotect, KF_SLEEPABLE)
+BTF_KFUNCS_END(bpf_fault_kfunc_ids)
+
+static const struct btf_kfunc_id_set bpf_fault_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &bpf_fault_kfunc_ids,
 };
 
 static struct bpf_struct_ops bpf_fault_struct_ops = {
@@ -770,6 +993,13 @@ static int __init bpf_fault_init(void)
 	ret = register_bpf_struct_ops(&bpf_fault_struct_ops, fault_ops);
 	if (ret) {
 		pr_err("bpf_fault: failed to register struct_ops: %d\n", ret);
+		return ret;
+	}
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
+					&bpf_fault_kfunc_set);
+	if (ret) {
+		pr_err("bpf_fault: failed to register kfuncs: %d\n", ret);
 		return ret;
 	}
 

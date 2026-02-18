@@ -5990,6 +5990,16 @@ static int prog_stream_read(union bpf_attr *attr)
 	return ret;
 }
 
+#define BPF_LINK_WRITEPROTECT_LAST_FIELD link_writeprotect.len
+
+static int link_writeprotect(union bpf_attr *attr)
+{
+	if (CHECK_ATTR(BPF_LINK_WRITEPROTECT))
+		return -EINVAL;
+
+	return bpf_fault_ops_link_writeprotect(attr);
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
@@ -6128,6 +6138,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_PROG_STREAM_READ_BY_FD:
 		err = prog_stream_read(&attr);
+		break;
+	case BPF_LINK_WRITEPROTECT:
+		err = link_writeprotect(&attr);
 		break;
 	default:
 		err = -EINVAL;

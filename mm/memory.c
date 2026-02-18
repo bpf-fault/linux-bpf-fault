@@ -103,7 +103,7 @@ static bool vmf_pte_changed(struct vm_fault *vmf);
  */
 static __always_inline bool vmf_orig_pte_uffd_wp(struct vm_fault *vmf)
 {
-	if (!userfaultfd_wp(vmf->vma))
+	if (!userfaultfd_wp(vmf->vma) && !bpf_fault_wp(vmf->vma))
 		return false;
 	if (!(vmf->flags & FAULT_FLAG_ORIG_PTE_VALID))
 		return false;
@@ -966,7 +966,7 @@ static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
 		pte = pte_mkclean(pte);
 	pte = pte_mkold(pte);
 
-	if (!userfaultfd_wp(dst_vma))
+	if (!userfaultfd_wp(dst_vma) && !bpf_fault_wp(dst_vma))
 		pte = pte_clear_uffd_wp(pte);
 
 	set_ptes(dst_vma->vm_mm, addr, dst_pte, pte, nr);
@@ -3946,13 +3946,17 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 			 * handling
 			 */
 			vmf->orig_pte = pte;
+		} else if (bpf_fault_pte_wp(vma, ptep_get(vmf->pte))) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return handle_bpf_fault_wp(vmf);
 		}
 
 		/*
 		 * Userfaultfd write-protect can defer flushes. Ensure the TLB
 		 * is flushed in this case before copying.
 		 */
-		if (unlikely(userfaultfd_wp(vmf->vma) &&
+		if (unlikely((userfaultfd_wp(vmf->vma) ||
+			      bpf_fault_wp(vmf->vma)) &&
 			     mm_tlb_flush_pending(vmf->vma->vm_mm)))
 			flush_tlb_page(vmf->vma, vmf->address);
 	}
@@ -4244,7 +4248,7 @@ static vm_fault_t pte_marker_handle_uffd_wp(struct vm_fault *vmf)
 	 * Just in case there're leftover special ptes even after the region
 	 * got unregistered - we can simply clear them.
 	 */
-	if (unlikely(!userfaultfd_wp(vmf->vma)))
+	if (unlikely(!userfaultfd_wp(vmf->vma) && !bpf_fault_wp(vmf->vma)))
 		return pte_marker_clear(vmf);
 
 	return do_pte_missing(vmf);
@@ -5043,7 +5047,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			return handle_userfault(vmf, VM_UFFD_MISSING);
 		}
-		if (bpf_fault_set(vma)) {
+		if (bpf_fault_missing(vma)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			return handle_bpf_fault(vmf);
 		}
@@ -5098,7 +5102,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		return handle_userfault(vmf, VM_UFFD_MISSING);
 	}
 
-	if (bpf_fault_set(vma)) {
+	if (bpf_fault_missing(vma)) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(folio);
 		return handle_bpf_fault(vmf);

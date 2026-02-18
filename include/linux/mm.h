@@ -416,8 +416,11 @@ extern unsigned int kobjsize(const void *objp);
 #ifdef CONFIG_BPF_FAULT
 #define VM_BPF_FAULT_BIT      43
 #define VM_BPF_FAULT          BIT(VM_BPF_FAULT_BIT)
+#define VM_BPF_FAULT_WP_BIT   44
+#define VM_BPF_FAULT_WP       BIT(VM_BPF_FAULT_WP_BIT)
 #else /* !CONFIG_BPF_FAULT */
 #define VM_BPF_FAULT          VM_NONE
+#define VM_BPF_FAULT_WP       VM_NONE
 #endif /* CONFIG_BPF_FAULT */
 
 #ifdef CONFIG_64BIT

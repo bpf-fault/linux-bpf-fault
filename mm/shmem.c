@@ -2525,7 +2525,7 @@ repeat:
 		*fault_type = handle_userfault(vmf, VM_UFFD_MINOR);
 		return 0;
 	}
-	if (folio && vma && bpf_fault_set(vma)) {
+	if (folio && vma && bpf_fault_missing(vma)) {
 		if (!xa_is_value(folio))
 			folio_put(folio);
 		*fault_type = handle_bpf_fault(vmf);
@@ -2580,7 +2580,7 @@ repeat:
 		*fault_type = handle_userfault(vmf, VM_UFFD_MISSING);
 		return 0;
 	}
-	if (vma && bpf_fault_set(vma)) {
+	if (vma && bpf_fault_missing(vma)) {
 		*fault_type = handle_bpf_fault(vmf);
 		return 0;
 	}

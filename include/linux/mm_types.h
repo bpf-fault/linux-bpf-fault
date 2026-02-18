@@ -707,13 +707,21 @@ struct vm_userfaultfd_ctx {
 struct vm_userfaultfd_ctx {};
 #endif /* CONFIG_USERFAULTFD */
 
+/* Fault types for bpf_fault_ops_ctx */
+enum {
+	BPF_FAULT_MISSING,	/* Page not present (missing fault) */
+	BPF_FAULT_WP,		/* Write-protection fault */
+};
+
 struct bpf_fault_ops_ctx {
 	struct vm_fault *vmf; /* TODO: break out relevant fields */
+	__u32 fault_type;     /* BPF_FAULT_MISSING or BPF_FAULT_WP */
 };
 
 struct fault_ops {
 	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
 				 unsigned char *page);
+	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx);
 };
 
 struct anon_vma_name {
