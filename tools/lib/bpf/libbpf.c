@@ -13219,20 +13219,10 @@ int bpf_link__update_map(struct bpf_link *link, const struct bpf_map *map)
 
 struct bpf_link_fault_ops {
 	struct bpf_link link;
-	int map_fd;
 };
 
 static int bpf_link__detach_fault_ops(struct bpf_link *link)
 {
-	struct bpf_link_fault_ops *st_link;
-	__u32 zero = 0;
-
-	st_link = container_of(link, struct bpf_link_fault_ops, link);
-
-	if (st_link->map_fd < 0)
-		/* w/o a real link */
-		return bpf_map_delete_elem(link->fd, &zero);
-
 	return close(link->fd);
 }
 
@@ -13257,6 +13247,12 @@ struct bpf_link *bpf_map__attach_fault_ops(const struct bpf_map *map,
 		return libbpf_err_ptr(-EINVAL);
 	}
 
+	if (!(map->def.map_flags & BPF_F_LINK)) {
+		pr_warn("map '%s': fault_ops requires SEC(\".struct_ops.link\")\n",
+			map->name);
+		return libbpf_err_ptr(-EINVAL);
+	}
+
 	link = calloc(1, sizeof(*link));
 	if (!link)
 		return libbpf_err_ptr(-ENOMEM);
@@ -13269,19 +13265,12 @@ struct bpf_link *bpf_map__attach_fault_ops(const struct bpf_map *map,
 	 * a struct_ops once it is set.  That ensures that the value
 	 * never changed.  So, it is safe to skip EBUSY.
 	 */
-	if (err && (!(map->def.map_flags & BPF_F_LINK) || err != -EBUSY)) {
+	if (err && err != -EBUSY) {
 		free(link);
 		return libbpf_err_ptr(err);
 	}
 
 	link->link.detach = bpf_link__detach_fault_ops;
-
-	if (!(map->def.map_flags & BPF_F_LINK)) {
-		/* w/o a real link */
-		link->link.fd = map->fd;
-		link->map_fd = -1;
-		return &link->link;
-	}
 
 	link_opts.fault.start = start;
 	link_opts.fault.len = len;
@@ -13294,7 +13283,6 @@ struct bpf_link *bpf_map__attach_fault_ops(const struct bpf_map *map,
 	}
 
 	link->link.fd = fd;
-	link->map_fd = map->fd;
 
 	return &link->link;
 }
