@@ -19,6 +19,7 @@
 #include <linux/mm_types.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/userfaultfd_k.h>
 
@@ -197,7 +198,17 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	rcu_read_unlock();
 
 	if (err) {
-		ret = VM_FAULT_SIGBUS;
+		/*
+		 * The fault lock was already released above, so we
+		 * cannot return VM_FAULT_SIGBUS (the caller would
+		 * double-release the VMA lock).  Deliver SIGBUS
+		 * directly and return RETRY so the caller skips its
+		 * own unlock and the signal is handled on return to
+		 * userspace.
+		 */
+		force_sig_fault(SIGBUS, BUS_ADRERR,
+				(void __user *)address);
+		ret = VM_FAULT_RETRY;
 		goto out_put_ctx;
 	}
 
@@ -373,7 +384,17 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	kunmap_local(kaddr);
 
 	if (err) {
-		ret = VM_FAULT_SIGBUS;
+		/*
+		 * The fault lock was already released above, so we
+		 * cannot return VM_FAULT_SIGBUS (the caller would
+		 * double-release the VMA lock).  Deliver SIGBUS
+		 * directly and return RETRY so the caller skips its
+		 * own unlock and the signal is handled on return to
+		 * userspace.
+		 */
+		force_sig_fault(SIGBUS, BUS_ADRERR,
+				(void __user *)address);
+		ret = VM_FAULT_RETRY;
 		goto out_put_folio;
 	}
 
@@ -394,52 +415,32 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	 */
 	vma = bpf_fault_lock_vma(mm, address);
 	if (IS_ERR(vma)) {
-		if (PTR_ERR(vma) == -ENOMEM)
-			ret = VM_FAULT_OOM;
-		else
-			ret = VM_FAULT_RETRY;
+		ret = VM_FAULT_RETRY;
 		goto out_put_folio;
 	}
 
-	if (!bpf_fault_missing(vma)) {
-		ret = VM_FAULT_SIGBUS;
+	if (!bpf_fault_missing(vma))
 		goto out_unlock;
-	}
 
-	if (mem_cgroup_charge(folio, mm, GFP_KERNEL)) {
-		ret = VM_FAULT_OOM;
+	if (mem_cgroup_charge(folio, mm, GFP_KERNEL))
 		goto out_unlock;
-	}
 
 	/* Walk page tables to find/allocate the PMD */
 	dst_pmd = bpf_fault_alloc_pmd(mm, address);
-	if (!dst_pmd) {
-		ret = VM_FAULT_OOM;
+	if (!dst_pmd)
 		goto out_unlock;
-	}
 
 	dst_pmdval = pmdp_get_lockless(dst_pmd);
 	if (unlikely(pmd_none(dst_pmdval)) &&
-	    unlikely(__pte_alloc(mm, dst_pmd))) {
-		ret = VM_FAULT_OOM;
+	    unlikely(__pte_alloc(mm, dst_pmd)))
 		goto out_unlock;
-	}
 
 	dst_pmdval = pmdp_get_lockless(dst_pmd);
-	if (unlikely(!pmd_present(dst_pmdval) || pmd_trans_huge(dst_pmdval))) {
-		/*
-		 * PTE was concurrently promoted to THP or is in an
-		 * unexpected state.  Return RETRY to let the fault
-		 * handler deal with it on the next attempt.
-		 */
-		ret = VM_FAULT_RETRY;
+	if (unlikely(!pmd_present(dst_pmdval) || pmd_trans_huge(dst_pmdval)))
 		goto out_unlock;
-	}
 
-	if (unlikely(pmd_bad(dst_pmdval))) {
-		ret = VM_FAULT_SIGBUS;
+	if (unlikely(pmd_bad(dst_pmdval)))
 		goto out_unlock;
-	}
 
 	err = mfill_atomic_install_pte(dst_pmd, vma, address,
 				       &folio->page, true,
@@ -461,6 +462,13 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 
 out_unlock:
 	bpf_fault_unlock_vma(vma);
+	/*
+	 * The original fault lock was released by release_fault_lock()
+	 * above.  We must return RETRY so the caller does not try to
+	 * release it a second time.  Transient errors (OOM, VMA race)
+	 * resolve naturally on the retry through the normal fault path.
+	 */
+	ret = VM_FAULT_RETRY;
 out_put_folio:
 	folio_put(folio);
 out_put_ctx:
