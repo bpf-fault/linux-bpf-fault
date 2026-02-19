@@ -5058,6 +5058,26 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	ret = vmf_anon_prepare(vmf);
 	if (ret)
 		return ret;
+
+	/*
+	 * Check bpf_fault before allocating a folio that would just be
+	 * discarded.  The read-path zero-page code already checks this
+	 * before any allocation, but write faults skip the zero-page
+	 * path and would otherwise allocate a folio only to free it at
+	 * the bpf_fault_missing() check below.
+	 */
+	if (bpf_fault_missing(vma)) {
+		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+						vmf->address, &vmf->ptl);
+		if (vmf->pte && !vmf_pte_changed(vmf)) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return handle_bpf_fault(vmf);
+		}
+		if (vmf->pte)
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+		/* PTE changed under us — fall through to the normal path */
+	}
+
 	/* Returns NULL on OOM or ERR_PTR(-EAGAIN) if we must retry the fault */
 	folio = alloc_anon_folio(vmf);
 	if (IS_ERR(folio))
