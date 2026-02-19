@@ -448,15 +448,25 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 
 	bpf_fault_unlock_vma(vma);
 
-	if (err)
+	if (err) {
 		folio_put(folio);
-
-	/*
-	 * Return RETRY whether the install succeeded or not.
-	 * On success, the retry will find the PTE present.
-	 * On failure, the retry will re-trigger the fault.
-	 */
-	ret = VM_FAULT_RETRY;
+		ret = VM_FAULT_RETRY;
+	} else if (!mapping) {
+		/*
+		 * Anonymous fault: PTE installed and VMA lock released.
+		 * Return COMPLETED so the arch fault code skips the
+		 * retry, avoiding a redundant VMA lookup + page table
+		 * walk just to find the PTE present.
+		 *
+		 * File-backed (shmem) faults must use RETRY because
+		 * the intermediate callers (__do_fault, shmem_fault)
+		 * don't handle COMPLETED and would try to process a
+		 * folio that doesn't exist.
+		 */
+		ret = VM_FAULT_COMPLETED;
+	} else {
+		ret = VM_FAULT_RETRY;
+	}
 	bpf_fault_ctx_put(ctx);
 	return ret;
 
