@@ -15,6 +15,8 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,7 @@
 #include <bpf/bpf.h>
 
 #include "wp_fault_ops.skel.h"
+#include "sigbus_fault_ops.skel.h"
 
 /*
  * UAPI constants for bpf_fault write-protect support.
@@ -45,6 +48,9 @@
 #define FILL_BYTE 'A'
 
 static long page_size;
+static sigjmp_buf jmp_env;
+static volatile sig_atomic_t sigbus_received;
+static volatile void *sigbus_addr;
 
 /*
  * Wrapper for BPF_LINK_WRITEPROTECT syscall.
@@ -70,6 +76,31 @@ static int bpf_link_writeprotect(int link_fd, __u64 start, __u64 len,
 	attr.len = len;
 
 	return syscall(__NR_bpf, BPF_LINK_WRITEPROTECT, &attr, sizeof(attr));
+}
+
+static void sigbus_handler(int sig, siginfo_t *si, void *ctx)
+{
+	(void)sig;
+	(void)ctx;
+	sigbus_received = 1;
+	sigbus_addr = si->si_addr;
+	siglongjmp(jmp_env, 1);
+}
+
+static int install_sigbus_handler(struct sigaction *old_sa)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = sigbus_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+
+	if (sigaction(SIGBUS, &sa, old_sa) < 0) {
+		perror("sigaction(SIGBUS)");
+		return -1;
+	}
+	return 0;
 }
 
 static __u64 read_wp_count(struct wp_fault_ops_bpf *skel)
@@ -436,10 +467,233 @@ out:
 	return ret;
 }
 
+/*
+ * Test 5: SIGBUS on write-protect faults.
+ */
+static int test_sigbus_on_wp_fault(void)
+{
+	const size_t num_pages = 8;
+	const size_t region_size = num_pages * page_size;
+	struct sigbus_fault_ops_bpf *skel = NULL;
+	struct bpf_link *link = NULL;
+	void *region = MAP_FAILED;
+	struct sigaction old_sa;
+	int handler_installed = 0;
+	int ret = -1;
+
+	printf("TEST: sigbus on wp fault ... ");
+	fflush(stdout);
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	skel = sigbus_fault_ops_bpf__open_and_load();
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		goto out;
+	}
+
+	link = bpf_map__attach_fault_ops(skel->maps.sigbus_fault_ops,
+					 region, region_size,
+					 BPF_FAULT_FLAG_WP);
+	if (!link) {
+		fprintf(stderr, "Failed to attach fault_ops: %s\n", strerror(errno));
+		goto out;
+	}
+
+	for (size_t i = 0; i < num_pages; i++) {
+		volatile char *p = (volatile char *)region + i * page_size;
+		(void)*p;
+	}
+
+	if (bpf_link_writeprotect(bpf_link__fd(link), (unsigned long)region,
+				  region_size, BPF_FAULT_WP_ENABLE) < 0) {
+		fprintf(stderr, "BPF_LINK_WRITEPROTECT enable failed: %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	if (install_sigbus_handler(&old_sa) < 0)
+		goto out;
+	handler_installed = 1;
+
+	skel->bss->wp_fault_count = 0;
+
+	for (size_t i = 0; i < num_pages; i++) {
+		volatile char *p = (volatile char *)region + i * page_size;
+
+		sigbus_received = 0;
+		sigbus_addr = NULL;
+
+		if (sigsetjmp(jmp_env, 1) == 0) {
+			*p = 'W';
+			fprintf(stderr,
+				"    FAIL: page %zu: no SIGBUS received\n", i);
+			goto out;
+		}
+
+		if (!sigbus_received) {
+			fprintf(stderr,
+				"    FAIL: page %zu: longjmp but no SIGBUS\n", i);
+			goto out;
+		}
+
+		{
+			unsigned long fault = (unsigned long)sigbus_addr;
+			unsigned long page_start = (unsigned long)region + i * page_size;
+
+			if (fault < page_start ||
+			    fault >= page_start + (unsigned long)page_size) {
+				fprintf(stderr,
+					"    FAIL: page %zu: si_addr=%lx expected [%lx,%lx)\n",
+					i, fault, page_start,
+					page_start + (unsigned long)page_size);
+				goto out;
+			}
+		}
+	}
+
+	if (skel->bss->wp_fault_count != num_pages) {
+		fprintf(stderr,
+			"    FAIL: wp_fault_count = %llu, expected %zu\n",
+			(unsigned long long)skel->bss->wp_fault_count, num_pages);
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	if (handler_installed)
+		sigaction(SIGBUS, &old_sa, NULL);
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		sigbus_fault_ops_bpf__destroy(skel);
+	if (region != MAP_FAILED)
+		munmap(region, region_size);
+
+	printf("%s\n", ret ? "FAIL" : "OK");
+	return ret;
+}
+
+/*
+ * Test 6: Resolving WP restores normal write path (no SIGBUS).
+ */
+static int test_wp_normal_after_resolve(void)
+{
+	const size_t num_pages = 8;
+	const size_t region_size = num_pages * page_size;
+	struct sigbus_fault_ops_bpf *skel = NULL;
+	struct bpf_link *link = NULL;
+	void *region = MAP_FAILED;
+	struct sigaction old_sa;
+	int handler_installed = 0;
+	int ret = -1;
+
+	printf("TEST: wp normal after resolve ... ");
+	fflush(stdout);
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	skel = sigbus_fault_ops_bpf__open_and_load();
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		goto out;
+	}
+
+	link = bpf_map__attach_fault_ops(skel->maps.sigbus_fault_ops,
+					 region, region_size,
+					 BPF_FAULT_FLAG_WP);
+	if (!link) {
+		fprintf(stderr, "Failed to attach fault_ops: %s\n", strerror(errno));
+		goto out;
+	}
+
+	for (size_t i = 0; i < num_pages; i++) {
+		volatile char *p = (volatile char *)region + i * page_size;
+		(void)*p;
+	}
+
+	if (bpf_link_writeprotect(bpf_link__fd(link), (unsigned long)region,
+				  region_size, BPF_FAULT_WP_ENABLE) < 0) {
+		fprintf(stderr, "WP enable failed: %s\n", strerror(errno));
+		goto out;
+	}
+
+	if (bpf_link_writeprotect(bpf_link__fd(link), (unsigned long)region,
+				  region_size, 0) < 0) {
+		fprintf(stderr, "WP resolve failed: %s\n", strerror(errno));
+		goto out;
+	}
+
+	if (install_sigbus_handler(&old_sa) < 0)
+		goto out;
+	handler_installed = 1;
+
+	skel->bss->wp_fault_count = 0;
+
+	for (size_t i = 0; i < num_pages; i++) {
+		volatile char *p = (volatile char *)region + i * page_size;
+
+		sigbus_received = 0;
+		if (sigsetjmp(jmp_env, 1) == 0) {
+			*p = 'R';
+		} else {
+			fprintf(stderr,
+				"    FAIL: page %zu: got SIGBUS after resolve\n", i);
+			goto out;
+		}
+
+		if (sigbus_received) {
+			fprintf(stderr,
+				"    FAIL: page %zu: SIGBUS flag set after resolve\n", i);
+			goto out;
+		}
+
+		if (*p != 'R') {
+			fprintf(stderr,
+				"    FAIL: page %zu: got 0x%02x expected 0x%02x\n",
+				i, (unsigned char)*p, 'R');
+			goto out;
+		}
+	}
+
+	if (skel->bss->wp_fault_count != 0) {
+		fprintf(stderr,
+			"    FAIL: wp_fault_count = %llu after resolve, expected 0\n",
+			(unsigned long long)skel->bss->wp_fault_count);
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	if (handler_installed)
+		sigaction(SIGBUS, &old_sa, NULL);
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		sigbus_fault_ops_bpf__destroy(skel);
+	if (region != MAP_FAILED)
+		munmap(region, region_size);
+
+	printf("%s\n", ret ? "FAIL" : "OK");
+	return ret;
+}
+
 int main(void)
 {
 	int failures = 0;
-	int total = 4;
+	int total = 6;
 
 	page_size = sysconf(_SC_PAGESIZE);
 
@@ -452,6 +706,10 @@ int main(void)
 	if (test_wp_no_missing())
 		failures++;
 	if (test_wp_flag_required())
+		failures++;
+	if (test_sigbus_on_wp_fault())
+		failures++;
+	if (test_wp_normal_after_resolve())
 		failures++;
 
 	printf("\n%d/%d tests passed\n", total - failures, total);

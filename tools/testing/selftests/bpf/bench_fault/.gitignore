@@ -4,6 +4,7 @@
 /test_shmem_fault
 /test_wp_fault
 /bench_fault_wp
+/test_sigbus_fault
 /*.bpf.o
 /*.skel.h
 /vmlinux.h

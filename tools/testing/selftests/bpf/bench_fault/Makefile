@@ -22,7 +22,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
-all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp
+all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -59,7 +59,7 @@ bench_fault_scale: bench_fault_scale.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 bench_fault_shmem: bench_fault_shmem.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
-test_shmem_fault: test_shmem_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+test_shmem_fault: test_shmem_fault.c fault_ops.skel.h sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 # WP fault test: separate BPF program and skeleton
@@ -69,15 +69,26 @@ wp_fault_ops.bpf.o: wp_fault_ops.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
 wp_fault_ops.skel.h: wp_fault_ops.bpf.o $(BPFTOOL)
 	$(BPFTOOL) gen skeleton $< > $@
 
-test_wp_fault: test_wp_fault.c wp_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+test_wp_fault: test_wp_fault.c wp_fault_ops.skel.h sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 bench_fault_wp: bench_fault_wp.c wp_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+# SIGBUS fault test: BPF handler that rejects missing faults
+sigbus_fault_ops.bpf.o: sigbus_fault_ops.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
+	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+
+sigbus_fault_ops.skel.h: sigbus_fault_ops.bpf.o $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+test_sigbus_fault: test_sigbus_fault.c sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
 clean:
-	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp \
+	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
 		fault_ops.bpf.o fault_ops.skel.h wp_fault_ops.bpf.o wp_fault_ops.skel.h \
+		sigbus_fault_ops.bpf.o sigbus_fault_ops.skel.h \
 		vmlinux.h $(BUILD_DIR)
 
 .PHONY: all clean
