@@ -130,7 +130,8 @@ static void print_latency_stats(uint64_t *lat, size_t n)
 static void print_results(const char *label, size_t num_pages,
 			   uint64_t t_start, uint64_t t_setup,
 			   uint64_t t_faults, uint64_t t_teardown,
-			   struct rusage_delta *rd, size_t n_lat)
+			   struct rusage_delta *rd, size_t n_lat,
+			   size_t sig_faults)
 {
 	printf("  Timings:\n");
 	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
@@ -145,6 +146,8 @@ static void print_results(const char *label, size_t num_pages,
 	printf("  Page faults:\n");
 	printf("    Minor: %ld\n", rd->minflt);
 	printf("    Major: %ld\n", rd->majflt);
+	if (sig_faults)
+		printf("    SIGSEGV: %zu\n", sig_faults);
 
 	print_latency_stats(fault_latencies, n_lat);
 	printf("\n");
@@ -272,7 +275,7 @@ static void bench_bpf_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("bpf_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages);
+		      t_faults, t_teardown, &rd, num_pages, 0);
 
 out:
 	if (link)
@@ -447,7 +450,7 @@ static void bench_uffd_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("uffd_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages);
+		      t_faults, t_teardown, &rd, num_pages, 0);
 
 out:
 	if (handler_started) {
@@ -472,6 +475,7 @@ out:
  */
 static void *sig_region;
 static size_t sig_region_size;
+static volatile size_t sig_fault_count;
 
 static void sigsegv_handler(int sig, siginfo_t *si, void *ctx)
 {
@@ -483,6 +487,7 @@ static void sigsegv_handler(int sig, siginfo_t *si, void *ctx)
 	 * of the uffd handler resolving the WP fault.
 	 */
 	mprotect((void *)page_addr, page_size, PROT_READ | PROT_WRITE);
+	sig_fault_count++;
 }
 
 static void bench_sigsegv_wp(size_t num_pages)
@@ -515,6 +520,7 @@ static void bench_sigsegv_wp(size_t num_pages)
 	/* Install SIGSEGV handler */
 	sig_region = region;
 	sig_region_size = region_size;
+	sig_fault_count = 0;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_sigaction = sigsegv_handler;
@@ -556,7 +562,7 @@ static void bench_sigsegv_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("sigsegv_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages);
+		      t_faults, t_teardown, &rd, num_pages, sig_fault_count);
 
 out:
 	if (region != MAP_FAILED)
