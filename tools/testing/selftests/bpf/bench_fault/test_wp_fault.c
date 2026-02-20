@@ -30,78 +30,11 @@
 
 #include "wp_fault_ops.skel.h"
 #include "sigbus_fault_ops.skel.h"
-
-/*
- * UAPI constants for bpf_fault write-protect support.
- * Defined here until they propagate to system headers.
- */
-#ifndef BPF_LINK_WRITEPROTECT
-#define BPF_LINK_WRITEPROTECT	38
-#endif
-#ifndef BPF_FAULT_FLAG_WP
-#define BPF_FAULT_FLAG_WP	(1U << 0)
-#endif
-#ifndef BPF_FAULT_WP_ENABLE
-#define BPF_FAULT_WP_ENABLE	(1U << 0)
-#endif
-
-#define FILL_BYTE 'A'
+#include "sigbus_util.h"
+#include "wp_util.h"
+#include "bench_fault_util.h"
 
 static long page_size;
-static sigjmp_buf jmp_env;
-static volatile sig_atomic_t sigbus_received;
-static volatile void *sigbus_addr;
-
-/*
- * Wrapper for BPF_LINK_WRITEPROTECT syscall.
- * Uses a local struct to avoid dependency on the full union bpf_attr
- * which may not yet include link_writeprotect in installed headers.
- */
-struct bpf_link_wp_attr {
-	__u32		link_fd;
-	__u32		flags;
-	__u64		start;
-	__u64		len;
-} __attribute__((aligned(8)));
-
-static int bpf_link_writeprotect(int link_fd, __u64 start, __u64 len,
-				 __u32 flags)
-{
-	struct bpf_link_wp_attr attr;
-
-	memset(&attr, 0, sizeof(attr));
-	attr.link_fd = link_fd;
-	attr.flags = flags;
-	attr.start = start;
-	attr.len = len;
-
-	return syscall(__NR_bpf, BPF_LINK_WRITEPROTECT, &attr, sizeof(attr));
-}
-
-static void sigbus_handler(int sig, siginfo_t *si, void *ctx)
-{
-	(void)sig;
-	(void)ctx;
-	sigbus_received = 1;
-	sigbus_addr = si->si_addr;
-	siglongjmp(jmp_env, 1);
-}
-
-static int install_sigbus_handler(struct sigaction *old_sa)
-{
-	struct sigaction sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = sigbus_handler;
-	sa.sa_flags = SA_SIGINFO;
-	sigemptyset(&sa.sa_mask);
-
-	if (sigaction(SIGBUS, &sa, old_sa) < 0) {
-		perror("sigaction(SIGBUS)");
-		return -1;
-	}
-	return 0;
-}
 
 static __u64 read_wp_count(struct wp_fault_ops_bpf *skel)
 {
@@ -111,23 +44,6 @@ static __u64 read_wp_count(struct wp_fault_ops_bpf *skel)
 static void reset_wp_count(struct wp_fault_ops_bpf *skel)
 {
 	skel->bss->wp_fault_count = 0;
-}
-
-static int check_page(const void *region, size_t page_idx,
-		      unsigned char expected)
-{
-	const unsigned char *p = (const unsigned char *)region +
-				 page_idx * page_size;
-
-	for (long i = 0; i < page_size; i++) {
-		if (p[i] != expected) {
-			fprintf(stderr,
-				"    FAIL: page %zu offset %ld: got 0x%02x expected 0x%02x\n",
-				page_idx, i, p[i], expected);
-			return -1;
-		}
-	}
-	return 0;
 }
 
 /*
@@ -380,7 +296,7 @@ static int test_wp_no_missing(void)
 	/* Read-fault each page — should get zero-filled by kernel, NOT 'A' */
 	ret = 0;
 	for (size_t i = 0; i < num_pages; i++) {
-		if (check_page(region, i, 0x00)) {
+		if (check_page(region, i, 0x00, page_size)) {
 			fprintf(stderr, "    (page %zu was filled by BPF, "
 				"but WP-only should not intercept missing faults)\n", i);
 			ret = -1;

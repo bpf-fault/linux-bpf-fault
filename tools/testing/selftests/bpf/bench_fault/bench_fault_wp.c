@@ -37,121 +37,10 @@
 #include <bpf/bpf.h>
 
 #include "wp_fault_ops.skel.h"
-
-/* UAPI constants — local defines until they propagate to system headers */
-#ifndef BPF_LINK_WRITEPROTECT
-#define BPF_LINK_WRITEPROTECT	38
-#endif
-#ifndef BPF_FAULT_FLAG_WP
-#define BPF_FAULT_FLAG_WP	(1U << 0)
-#endif
-#ifndef BPF_FAULT_WP_ENABLE
-#define BPF_FAULT_WP_ENABLE	(1U << 0)
-#endif
-
-/* ------------------------------------------------------------------ */
-/*  Timing helpers                                                     */
-/* ------------------------------------------------------------------ */
-
-static inline uint64_t now_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-struct rusage_delta {
-	long vol_csw;
-	long invol_csw;
-	long minflt;
-	long majflt;
-};
-
-static struct rusage rusage_snap(void)
-{
-	struct rusage ru;
-
-	getrusage(RUSAGE_SELF, &ru);
-	return ru;
-}
-
-static struct rusage_delta rusage_diff(struct rusage *before,
-				       struct rusage *after)
-{
-	return (struct rusage_delta){
-		.vol_csw   = after->ru_nvcsw   - before->ru_nvcsw,
-		.invol_csw = after->ru_nivcsw  - before->ru_nivcsw,
-		.minflt    = after->ru_minflt  - before->ru_minflt,
-		.majflt    = after->ru_majflt  - before->ru_majflt,
-	};
-}
-
-/* ------------------------------------------------------------------ */
-/*  Per-fault latency tracking                                         */
-/* ------------------------------------------------------------------ */
+#include "bench_fault_util.h"
+#include "wp_util.h"
 
 static uint64_t *fault_latencies;
-
-static int cmp_u64(const void *a, const void *b)
-{
-	uint64_t va = *(const uint64_t *)a;
-	uint64_t vb = *(const uint64_t *)b;
-
-	return (va > vb) - (va < vb);
-}
-
-static void print_latency_stats(uint64_t *lat, size_t n)
-{
-	uint64_t sum = 0, min_v = UINT64_MAX, max_v = 0;
-
-	if (!n)
-		return;
-
-	qsort(lat, n, sizeof(uint64_t), cmp_u64);
-
-	for (size_t i = 0; i < n; i++) {
-		sum += lat[i];
-		if (lat[i] < min_v)
-			min_v = lat[i];
-		if (lat[i] > max_v)
-			max_v = lat[i];
-	}
-
-	printf("    Per-fault latency (ns):\n");
-	printf("      avg:  %lu\n", sum / n);
-	printf("      min:  %lu\n", min_v);
-	printf("      max:  %lu\n", max_v);
-	printf("      p50:  %lu\n", lat[n / 2]);
-	printf("      p99:  %lu\n", lat[(size_t)(n * 0.99)]);
-	printf("      p999: %lu\n", lat[(size_t)(n * 0.999)]);
-}
-
-static void print_results(const char *label, size_t num_pages,
-			   uint64_t t_start, uint64_t t_setup,
-			   uint64_t t_faults, uint64_t t_teardown,
-			   struct rusage_delta *rd, size_t n_lat,
-			   size_t sig_faults)
-{
-	printf("  Timings:\n");
-	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
-	printf("    Faults:     %10.3f ms\n", (t_faults - t_setup) / 1e6);
-	printf("    Teardown:   %10.3f ms\n", (t_teardown - t_faults) / 1e6);
-	printf("    Total:      %10.3f ms\n", (t_teardown - t_start) / 1e6);
-	printf("    Throughput: %10.0f faults/sec\n",
-	       num_pages / ((t_faults - t_setup) / 1e9));
-	printf("  Context switches:\n");
-	printf("    Voluntary:   %ld\n", rd->vol_csw);
-	printf("    Involuntary: %ld\n", rd->invol_csw);
-	printf("  Page faults:\n");
-	printf("    Minor: %ld\n", rd->minflt);
-	printf("    Major: %ld\n", rd->majflt);
-	if (sig_faults)
-		printf("    SIGSEGV: %zu\n", sig_faults);
-
-	print_latency_stats(fault_latencies, n_lat);
-	printf("\n");
-}
 
 static long page_size;
 
@@ -166,31 +55,6 @@ static void populate_pages(void *region, size_t num_pages)
 		volatile char *p = (volatile char *)region + i * page_size;
 		*p = 'P';
 	}
-}
-
-/* ------------------------------------------------------------------ */
-/*  BPF_LINK_WRITEPROTECT syscall wrapper                              */
-/* ------------------------------------------------------------------ */
-
-struct bpf_link_wp_attr {
-	__u32		link_fd;
-	__u32		flags;
-	__u64		start;
-	__u64		len;
-} __attribute__((aligned(8)));
-
-static int bpf_link_writeprotect(int link_fd, __u64 start, __u64 len,
-				 __u32 flags)
-{
-	struct bpf_link_wp_attr attr;
-
-	memset(&attr, 0, sizeof(attr));
-	attr.link_fd = link_fd;
-	attr.flags = flags;
-	attr.start = start;
-	attr.len = len;
-
-	return syscall(__NR_bpf, BPF_LINK_WRITEPROTECT, &attr, sizeof(attr));
 }
 
 /* ------------------------------------------------------------------ */
@@ -275,7 +139,7 @@ static void bench_bpf_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("bpf_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages, 0);
+		      t_faults, t_teardown, &rd, fault_latencies, num_pages, 0);
 
 out:
 	if (link)
@@ -450,7 +314,7 @@ static void bench_uffd_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("uffd_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages, 0);
+		      t_faults, t_teardown, &rd, fault_latencies, num_pages, 0);
 
 out:
 	if (handler_started) {
@@ -562,7 +426,7 @@ static void bench_sigsegv_wp(size_t num_pages)
 
 	rd = rusage_diff(&ru_before, &ru_after);
 	print_results("sigsegv_wp", num_pages, t_start, t_setup,
-		      t_faults, t_teardown, &rd, num_pages, sig_fault_count);
+		      t_faults, t_teardown, &rd, fault_latencies, num_pages, sig_fault_count);
 
 out:
 	if (region != MAP_FAILED)

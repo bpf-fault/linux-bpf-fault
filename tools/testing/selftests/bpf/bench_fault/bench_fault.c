@@ -37,80 +37,9 @@
 #include <bpf/bpf.h>
 
 #include "fault_ops.skel.h"
+#include "bench_fault_util.h"
 
-#define FILL_BYTE 'A'
-
-/* ------------------------------------------------------------------ */
-/*  Timing helpers                                                     */
-/* ------------------------------------------------------------------ */
-
-static inline uint64_t now_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-struct rusage_delta {
-	long vol_csw;
-	long invol_csw;
-	long minflt;
-	long majflt;
-};
-
-static struct rusage rusage_snap(void)
-{
-	struct rusage ru;
-	getrusage(RUSAGE_SELF, &ru);
-	return ru;
-}
-
-static struct rusage_delta rusage_diff(struct rusage *before,
-				       struct rusage *after)
-{
-	return (struct rusage_delta){
-		.vol_csw   = after->ru_nvcsw   - before->ru_nvcsw,
-		.invol_csw = after->ru_nivcsw  - before->ru_nivcsw,
-		.minflt    = after->ru_minflt  - before->ru_minflt,
-		.majflt    = after->ru_majflt  - before->ru_majflt,
-	};
-}
-
-/* ------------------------------------------------------------------ */
-/*  Per-fault latency tracking                                         */
-/* ------------------------------------------------------------------ */
-
-static uint64_t *fault_latencies;  /* array[num_pages] */
-
-static int cmp_u64(const void *a, const void *b)
-{
-	uint64_t va = *(const uint64_t *)a;
-	uint64_t vb = *(const uint64_t *)b;
-	return (va > vb) - (va < vb);
-}
-
-static void print_latency_stats(uint64_t *lat, size_t n)
-{
-	uint64_t sum = 0, min_v = UINT64_MAX, max_v = 0;
-
-	if (!n) return;
-
-	qsort(lat, n, sizeof(uint64_t), cmp_u64);
-
-	for (size_t i = 0; i < n; i++) {
-		sum += lat[i];
-		if (lat[i] < min_v) min_v = lat[i];
-		if (lat[i] > max_v) max_v = lat[i];
-	}
-
-	printf("    Per-fault latency (ns):\n");
-	printf("      avg:  %lu\n", sum / n);
-	printf("      min:  %lu\n", min_v);
-	printf("      max:  %lu\n", max_v);
-	printf("      p50:  %lu\n", lat[n / 2]);
-	printf("      p99:  %lu\n", lat[(size_t)(n * 0.99)]);
-	printf("      p999: %lu\n", lat[(size_t)(n * 0.999)]);
-}
+static uint64_t *fault_latencies;
 
 /* ------------------------------------------------------------------ */
 /*  baseline benchmark (anonymous faults, no uffd/bpf)           */
@@ -177,23 +106,9 @@ static void bench_baseline(size_t num_pages, size_t page_size)
 	else
 		printf("  Verification: OK\n");
 
-	/* Results */
 	rd = rusage_diff(&ru_before, &ru_after);
-	printf("  Timings:\n");
-	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
-	printf("    Faults:     %10.3f ms\n", (t_faults - t_setup) / 1e6);
-	printf("    Total:      %10.3f ms\n", (t_end - t_start) / 1e6);
-	printf("    Throughput: %10.0f faults/sec\n",
-	       num_pages / ((t_faults - t_setup) / 1e9));
-	printf("  Context switches:\n");
-	printf("    Voluntary:   %ld\n", rd.vol_csw);
-	printf("    Involuntary: %ld\n", rd.invol_csw);
-	printf("  Page faults:\n");
-	printf("    Minor: %ld\n", rd.minflt);
-	printf("    Major: %ld\n", rd.majflt);
-
-	print_latency_stats(fault_latencies, num_pages);
-	printf("\n");
+	print_results("baseline", num_pages, t_start, t_setup,
+		      t_faults, t_end, &rd, fault_latencies, num_pages, 0);
 
 	munmap(region, region_size);
 	free(fault_latencies);
@@ -368,24 +283,9 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size)
 	else
 		printf("  Verification: OK\n");
 
-	/* Results */
 	rd = rusage_diff(&ru_before, &ru_after);
-	printf("  Timings:\n");
-	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
-	printf("    Faults:     %10.3f ms\n", (t_faults - t_setup) / 1e6);
-	printf("    Teardown:   %10.3f ms\n", (t_teardown - t_faults) / 1e6);
-	printf("    Total:      %10.3f ms\n", (t_end - t_start) / 1e6);
-	printf("    Throughput: %10.0f faults/sec\n",
-	       num_pages / ((t_faults - t_setup) / 1e9));
-	printf("  Context switches:\n");
-	printf("    Voluntary:   %ld\n", rd.vol_csw);
-	printf("    Involuntary: %ld\n", rd.invol_csw);
-	printf("  Page faults:\n");
-	printf("    Minor: %ld\n", rd.minflt);
-	printf("    Major: %ld\n", rd.majflt);
-
-	print_latency_stats(fault_latencies, num_pages);
-	printf("\n");
+	print_results("userfaultfd", num_pages, t_start, t_setup,
+		      t_faults, t_end, &rd, fault_latencies, num_pages, 0);
 
 	munmap(region, region_size);
 	free(fault_latencies);
@@ -500,24 +400,9 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 	else
 		printf("  Verification: OK\n");
 
-	/* Results */
 	rd = rusage_diff(&ru_before, &ru_after);
-	printf("  Timings:\n");
-	printf("    Setup:      %10.3f ms\n", (t_setup - t_start) / 1e6);
-	printf("    Faults:     %10.3f ms\n", (t_faults - t_setup) / 1e6);
-	printf("    Teardown:   %10.3f ms\n", (t_teardown - t_faults) / 1e6);
-	printf("    Total:      %10.3f ms\n", (t_end - t_start) / 1e6);
-	printf("    Throughput: %10.0f faults/sec\n",
-	       num_pages / ((t_faults - t_setup) / 1e9));
-	printf("  Context switches:\n");
-	printf("    Voluntary:   %ld\n", rd.vol_csw);
-	printf("    Involuntary: %ld\n", rd.invol_csw);
-	printf("  Page faults:\n");
-	printf("    Minor: %ld\n", rd.minflt);
-	printf("    Major: %ld\n", rd.majflt);
-
-	print_latency_stats(fault_latencies, num_pages);
-	printf("\n");
+	print_results("bpf_fault", num_pages, t_start, t_setup,
+		      t_faults, t_end, &rd, fault_latencies, num_pages, 0);
 
 	munmap(region, region_size);
 	free(fault_latencies);

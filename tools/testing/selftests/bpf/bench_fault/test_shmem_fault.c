@@ -32,67 +32,10 @@
 
 #include "fault_ops.skel.h"
 #include "sigbus_fault_ops.skel.h"
-
-#define FILL_BYTE 'A'
+#include "sigbus_util.h"
+#include "bench_fault_util.h"
 
 static long page_size;
-static sigjmp_buf jmp_env;
-static volatile sig_atomic_t sigbus_received;
-static volatile void *sigbus_addr;
-
-static void sigbus_handler(int sig, siginfo_t *si, void *ctx)
-{
-	(void)sig;
-	(void)ctx;
-	sigbus_received = 1;
-	sigbus_addr = si->si_addr;
-	siglongjmp(jmp_env, 1);
-}
-
-static int install_sigbus_handler(struct sigaction *old_sa)
-{
-	struct sigaction sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = sigbus_handler;
-	sa.sa_flags = SA_SIGINFO;
-	sigemptyset(&sa.sa_mask);
-
-	if (sigaction(SIGBUS, &sa, old_sa) < 0) {
-		perror("sigaction(SIGBUS)");
-		return -1;
-	}
-	return 0;
-}
-
-static int check_page(const void *region, size_t page_idx,
-		      unsigned char expected)
-{
-	const unsigned char *p = (const unsigned char *)region +
-				 page_idx * page_size;
-
-	for (long i = 0; i < page_size; i++) {
-		if (p[i] != expected) {
-			fprintf(stderr,
-				"    FAIL: page %zu offset %ld: got 0x%02x expected 0x%02x\n",
-				page_idx, i, p[i], expected);
-			return -1;
-		}
-	}
-	return 0;
-}
-
-/*
- * Find a writable tmpfs mount point.  Prefer /dev/shm, fall back to /tmp.
- */
-static const char *find_tmpfs(void)
-{
-	struct stat st;
-
-	if (stat("/dev/shm", &st) == 0)
-		return "/dev/shm";
-	return "/tmp";
-}
 
 /*
  * Test 1: bpf_fault on pages that exist in the page cache.
@@ -165,7 +108,7 @@ static int test_cached_pages(void)
 	/* Verify: BPF program should have filled with 'A' */
 	ret = 0;
 	for (size_t i = 0; i < num_pages; i++) {
-		if (check_page(region, i, FILL_BYTE)) {
+		if (check_page(region, i, FILL_BYTE, page_size)) {
 			ret = -1;
 			break;
 		}
@@ -265,7 +208,7 @@ static int test_hole_pages(void)
 	/* Verify: hole pages should be filled with 'A' by BPF program */
 	ret = 0;
 	for (size_t i = written_pages; i < num_pages; i++) {
-		if (check_page(region, i, FILL_BYTE)) {
+		if (check_page(region, i, FILL_BYTE, page_size)) {
 			ret = -1;
 			break;
 		}
@@ -433,7 +376,7 @@ static int test_mixed(void)
 	/* All pages should contain 'A' from BPF program */
 	ret = 0;
 	for (size_t i = 0; i < num_pages; i++) {
-		if (check_page(region, i, FILL_BYTE)) {
+		if (check_page(region, i, FILL_BYTE, page_size)) {
 			fprintf(stderr, "    (page %zu is %s)\n", i,
 				i < written_pages ? "cached" : "hole");
 			ret = -1;
@@ -609,7 +552,7 @@ static int test_large_folio(void)
 	/* All pages should contain FILL_BYTE from the BPF program */
 	ret = 0;
 	for (size_t i = 0; i < num_pages; i++) {
-		if (check_page(region, i, FILL_BYTE)) {
+		if (check_page(region, i, FILL_BYTE, page_size)) {
 			ret = -1;
 			break;
 		}

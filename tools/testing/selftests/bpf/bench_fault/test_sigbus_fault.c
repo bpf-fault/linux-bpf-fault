@@ -27,36 +27,9 @@
 #include <bpf/bpf.h>
 
 #include "sigbus_fault_ops.skel.h"
+#include "sigbus_util.h"
 
 static long page_size;
-
-/* Signal handler state */
-static sigjmp_buf jmp_env;
-static volatile sig_atomic_t sigbus_received;
-static volatile void *sigbus_addr;
-
-static void sigbus_handler(int sig, siginfo_t *si, void *ctx)
-{
-	sigbus_received = 1;
-	sigbus_addr = si->si_addr;
-	siglongjmp(jmp_env, 1);
-}
-
-static int install_sigbus_handler(struct sigaction *old_sa)
-{
-	struct sigaction sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = sigbus_handler;
-	sa.sa_flags = SA_SIGINFO;
-	sigemptyset(&sa.sa_mask);
-
-	if (sigaction(SIGBUS, &sa, old_sa) < 0) {
-		perror("sigaction(SIGBUS)");
-		return -1;
-	}
-	return 0;
-}
 
 /*
  * Test 1: SIGBUS on missing fault.

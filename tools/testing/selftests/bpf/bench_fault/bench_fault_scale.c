@@ -35,20 +35,7 @@
 #include <bpf/bpf.h>
 
 #include "fault_ops.skel.h"
-
-#define FILL_BYTE 'A'
-
-/* ------------------------------------------------------------------ */
-/*  Timing                                                             */
-/* ------------------------------------------------------------------ */
-
-static inline uint64_t now_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+#include "bench_fault_util.h"
 
 /* ------------------------------------------------------------------ */
 /*  Worker thread context                                              */
