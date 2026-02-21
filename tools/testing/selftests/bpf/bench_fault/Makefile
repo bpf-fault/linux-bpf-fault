@@ -22,7 +22,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
-all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault
+all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -85,8 +85,14 @@ sigbus_fault_ops.skel.h: sigbus_fault_ops.bpf.o $(BPFTOOL)
 test_sigbus_fault: test_sigbus_fault.c sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+# Multi-region test
+test_multi_region: test_multi_region.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
+
 clean:
 	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
+		test_multi_region \
 		fault_ops.bpf.o fault_ops.skel.h wp_fault_ops.bpf.o wp_fault_ops.skel.h \
 		sigbus_fault_ops.bpf.o sigbus_fault_ops.skel.h \
 		vmlinux.h $(BUILD_DIR)

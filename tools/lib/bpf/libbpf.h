@@ -903,6 +903,9 @@ LIBBPF_API struct bpf_link *
 bpf_map__attach_fault_ops(const struct bpf_map *map, void *start,
 			  unsigned long len, unsigned int flags);
 
+LIBBPF_API int bpf_link__fault_register(int link_fd, __u64 start, __u64 len);
+LIBBPF_API int bpf_link__fault_unregister(int link_fd, __u64 start, __u64 len);
+
 struct bpf_iter_attach_opts {
 	size_t sz; /* size of this struct for forward/backward compatibility */
 	union bpf_iter_link_info *link_info;

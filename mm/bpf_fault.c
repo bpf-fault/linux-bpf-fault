@@ -514,6 +514,7 @@ void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx)
 {
 	if (!ctx)
 		return;
+
 	if (ctx->mm)
 		mmdrop(ctx->mm);
 	kmem_cache_free(bpf_fault_ctx_cachep, ctx);
@@ -542,8 +543,11 @@ static __always_inline int bpf_fault_validate_range(struct mm_struct *mm,
 /*
  * Register a VMA range for BPF fault handling.  Sets VM_BPF_FAULT on the
  * specified range, similar to how userfaultfd_register sets UFFD flags.
+ *
+ * Internal helper: assumes ctx->flags is already set by the caller.
  */
-int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 flags)
+static int __bpf_fault_register_range(struct bpf_fault_ctx *ctx,
+				      __u64 start, __u64 len)
 {
 	struct mm_struct *mm = ctx->mm;
 	struct vm_area_struct *vma, *prev, *cur;
@@ -555,18 +559,11 @@ int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 
 	unsigned long vma_start = start;
 	unsigned long end = start + len;
 
-	/*
-	 * TODO: support combined missing + WP registrations.  This will
-	 * require a new BPF_FAULT_FLAG_MISSING so userspace can opt in
-	 * to both modes, and handle_bpf_fault() already installs PTEs
-	 * with MFILL_ATOMIC_WP when bpf_fault_wp() is set.
-	 */
-	if (flags & BPF_FAULT_FLAG_WP)
+	if (ctx->flags & BPF_FAULT_FLAG_WP)
 		vm_flags |= VM_BPF_FAULT_WP;
 	else
 		vm_flags |= VM_BPF_FAULT;
 
-	ctx->flags = flags;
 	VMA_ITERATOR(vmi, mm, 0);
 
 	ret = bpf_fault_validate_range(mm, start, len);
@@ -695,6 +692,116 @@ int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len, __u32 
 		vm_flags_reset(vma, new_flags);
 
 skip:
+		prev = vma;
+		vma_start = vma->vm_end;
+	}
+
+out_unlock:
+	mmap_write_unlock(mm);
+	mmput(mm);
+	return ret;
+}
+
+int bpf_fault_register(struct bpf_fault_ctx *ctx, __u64 start, __u64 len,
+		       __u32 flags)
+{
+	ctx->flags = flags;
+	return __bpf_fault_register_range(ctx, start, len);
+}
+
+int bpf_fault_add_region(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
+{
+	return __bpf_fault_register_range(ctx, start, len);
+}
+
+static struct vm_area_struct *bpf_fault_clear_vma(struct vma_iterator *vmi,
+						  struct vm_area_struct *prev,
+						  struct vm_area_struct *vma,
+						  unsigned long start,
+						  unsigned long end);
+
+/*
+ * Unregister a VMA range from BPF fault handling.  Clears VM_BPF_FAULT
+ * and VM_BPF_FAULT_WP from the specified range.
+ */
+int bpf_fault_unregister(struct bpf_fault_ctx *ctx, __u64 start, __u64 len)
+{
+	struct mm_struct *mm = ctx->mm;
+	struct vm_area_struct *vma, *prev, *cur;
+	int ret;
+	unsigned long vma_start = start;
+	unsigned long end = start + len;
+	bool found;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	ret = bpf_fault_validate_range(mm, start, len);
+	if (ret)
+		return ret;
+
+	if (!mmget_not_zero(mm))
+		return -ENOMEM;
+
+	mmap_write_lock(mm);
+
+	/*
+	 * Phase 1: validate all VMAs in range belong to this ctx
+	 * (or are unregistered).
+	 */
+	vma_iter_init(&vmi, mm, vma_start);
+	vma = vma_find(&vmi, end);
+	if (!vma) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	found = false;
+	cur = vma;
+	do {
+		cond_resched();
+
+		if (cur->vm_userfaultfd_ctx.bpf_ctx &&
+		    cur->vm_userfaultfd_ctx.bpf_ctx != ctx) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		found = true;
+	} for_each_vma_range(vmi, cur, end);
+	BUG_ON(!found);
+
+	/*
+	 * Phase 2: clear bpf_fault flags from each registered VMA
+	 * in range.
+	 */
+	vma_iter_set(&vmi, vma_start);
+	prev = vma_prev(&vmi);
+	if (vma->vm_start < vma_start)
+		prev = vma;
+
+	ret = 0;
+	for_each_vma_range(vmi, vma, end) {
+		cond_resched();
+
+		if (!bpf_fault_set(vma)) {
+			prev = vma;
+			continue;
+		}
+
+		if (vma->vm_userfaultfd_ctx.bpf_ctx != ctx) {
+			prev = vma;
+			continue;
+		}
+
+		if (vma->vm_start > vma_start)
+			vma_start = vma->vm_start;
+
+		vma = bpf_fault_clear_vma(&vmi, prev, vma,
+					  vma_start, min(end, vma->vm_end));
+		if (IS_ERR(vma)) {
+			ret = PTR_ERR(vma);
+			break;
+		}
+
 		prev = vma;
 		vma_start = vma->vm_end;
 	}

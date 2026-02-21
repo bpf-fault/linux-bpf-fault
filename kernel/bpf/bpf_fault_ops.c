@@ -234,10 +234,10 @@ int bpf_fault_ops_link_writeprotect(union bpf_attr *attr)
 	bool enable_wp;
 	int err;
 
-	if (attr->link_writeprotect.flags & ~BPF_FAULT_WP_ENABLE)
+	if (attr->link_fault_cmd.flags & ~BPF_FAULT_WP_ENABLE)
 		return -EINVAL;
 
-	link = bpf_link_get_from_fd(attr->link_writeprotect.link_fd);
+	link = bpf_link_get_from_fd(attr->link_fault_cmd.link_fd);
 	if (IS_ERR(link))
 		return PTR_ERR(link);
 
@@ -258,13 +258,81 @@ int bpf_fault_ops_link_writeprotect(union bpf_attr *attr)
 		goto out_put_link;
 	}
 
-	enable_wp = !!(attr->link_writeprotect.flags & BPF_FAULT_WP_ENABLE);
+	enable_wp = !!(attr->link_fault_cmd.flags & BPF_FAULT_WP_ENABLE);
 	err = bpf_fault_wp_range(ctx->mm,
-				 attr->link_writeprotect.start,
-				 attr->link_writeprotect.len,
+				 attr->link_fault_cmd.start,
+				 attr->link_fault_cmd.len,
 				 enable_wp);
 
 out_put_link:
 	bpf_link_put(link);
 	return err;
 }
+
+int bpf_fault_ops_link_add_region(union bpf_attr *attr)
+{
+	struct bpf_fault_ops_link *st_link;
+	struct bpf_fault_ctx *ctx;
+	struct bpf_link *link;
+	int err;
+
+	link = bpf_link_get_from_fd(attr->link_fault_cmd.link_fd);
+	if (IS_ERR(link))
+		return PTR_ERR(link);
+
+	if (link->type != BPF_LINK_TYPE_FAULT_OPS) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+
+	st_link = container_of(link, struct bpf_fault_ops_link, link);
+	ctx = st_link->ctx;
+	if (!ctx) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+
+	err = bpf_fault_add_region(ctx,
+				   attr->link_fault_cmd.start,
+				   attr->link_fault_cmd.len);
+
+out_put_link:
+	bpf_link_put(link);
+	return err;
+}
+
+int bpf_fault_ops_link_remove_region(union bpf_attr *attr)
+{
+	struct bpf_fault_ops_link *st_link;
+	struct bpf_fault_ctx *ctx;
+	struct bpf_link *link;
+	int err;
+
+	link = bpf_link_get_from_fd(attr->link_fault_cmd.link_fd);
+	if (IS_ERR(link))
+		return PTR_ERR(link);
+
+	if (link->type != BPF_LINK_TYPE_FAULT_OPS) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+
+	st_link = container_of(link, struct bpf_fault_ops_link, link);
+	ctx = st_link->ctx;
+	if (!ctx) {
+		err = -EINVAL;
+		goto out_put_link;
+	}
+
+	err = bpf_fault_unregister(ctx,
+				   attr->link_fault_cmd.start,
+				   attr->link_fault_cmd.len);
+
+out_put_link:
+	bpf_link_put(link);
+	return err;
+}
+
+/*
+ * Allocate a lightweight link for a fork-inherited bpf_fault context.
+ * Shares the parent's struct_ops map via bpf_map_inc().  The returned

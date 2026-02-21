@@ -450,4 +450,6 @@ LIBBPF_1.6.0 {
 LIBBPF_1.7.0 {
 	global:
 		bpf_map__attach_fault_ops;
+		bpf_link__fault_register;
+		bpf_link__fault_unregister;
 } LIBBPF_1.6.0;
