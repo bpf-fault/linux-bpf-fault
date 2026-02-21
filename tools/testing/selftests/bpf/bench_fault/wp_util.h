@@ -32,6 +32,9 @@
 #ifndef BPF_FAULT_UNREGISTER
 #define BPF_FAULT_UNREGISTER	(1U << 2)
 #endif
+#ifndef BPF_FAULT_CLAIM
+#define BPF_FAULT_CLAIM		(1U << 3)
+#endif
 
 struct bpf_link_fault_cmd_attr {
 	__u32		link_fd;
@@ -73,6 +76,16 @@ static inline int bpf_link_fault_unregister(int link_fd, __u64 start,
 		.flags = BPF_FAULT_UNREGISTER,
 		.start = start,
 		.len = len,
+	};
+
+	return syscall(__NR_bpf, BPF_LINK_FAULT_OPS_CMD, &attr, sizeof(attr));
+}
+
+static inline int bpf_link_fault_claim(int parent_link_fd)
+{
+	struct bpf_link_fault_cmd_attr attr = {
+		.link_fd = parent_link_fd,
+		.flags = BPF_FAULT_CLAIM,
 	};
 
 	return syscall(__NR_bpf, BPF_LINK_FAULT_OPS_CMD, &attr, sizeof(attr));

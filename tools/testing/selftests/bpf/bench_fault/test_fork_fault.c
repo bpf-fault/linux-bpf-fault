@@ -530,6 +530,189 @@ out:
 }
 
 /*
+ * Test 8: Claim inherited context.
+ *
+ * Parent registers with INHERIT, forks.  Child calls BPF_FAULT_CLAIM
+ * to get a proper link fd, then uses that fd to add a new region.
+ */
+static int test_claim(void)
+{
+	const size_t region_size = page_size;
+	struct fault_ops_bpf *skel = NULL;
+	struct bpf_link *link = NULL;
+	void *region = MAP_FAILED;
+	pid_t pid;
+	int status;
+	int ret = -1;
+
+	printf("TEST: claim inherited context ... ");
+	fflush(stdout);
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	skel = fault_ops_bpf__open_and_load();
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		goto out;
+	}
+
+	link = bpf_map__attach_fault_ops(skel->maps.bench_fault_ops,
+					 region, region_size,
+					 BPF_FAULT_FLAG_INHERIT);
+	if (!link) {
+		fprintf(stderr, "Failed to attach fault_ops: %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		goto out;
+	}
+
+	if (pid == 0) {
+		/* Child: claim the inherited context */
+		int parent_fd = bpf_link__fd(link);
+		int child_fd;
+		void *region2;
+
+		child_fd = bpf_link_fault_claim(parent_fd);
+		if (child_fd < 0) {
+			fprintf(stderr, "\n    claim failed: %s\n",
+				strerror(errno));
+			_exit(1);
+		}
+
+		/* Verify faults still work on the original region */
+		volatile char *p = (volatile char *)region;
+		(void)*p;
+		if (check_page(region, 0, FILL_BYTE, page_size) < 0)
+			_exit(2);
+
+		/* Use the claimed fd to add a new region */
+		region2 = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (region2 == MAP_FAILED)
+			_exit(3);
+
+		if (bpf_link_fault_register(child_fd,
+					    (unsigned long)region2,
+					    region_size) < 0) {
+			fprintf(stderr, "\n    register via claimed fd failed: %s\n",
+				strerror(errno));
+			_exit(4);
+		}
+
+		/* Fault on the new region */
+		volatile char *p2 = (volatile char *)region2;
+		(void)*p2;
+		if (check_page(region2, 0, FILL_BYTE, page_size) < 0)
+			_exit(5);
+
+		/* Close the claimed fd (proper cleanup) */
+		close(child_fd);
+		munmap(region2, region_size);
+		_exit(0);
+	}
+
+	/* Parent: wait for child */
+	if (waitpid(pid, &status, 0) < 0) {
+		perror("waitpid");
+		goto out;
+	}
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "    FAIL: child exited with status %d\n",
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		goto out;
+	}
+
+	ret = 0;
+	printf("PASS\n");
+
+out:
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		fault_ops_bpf__destroy(skel);
+	if (region != MAP_FAILED)
+		munmap(region, region_size);
+	return ret;
+}
+
+/*
+ * Test 9: Claim returns ENOENT for non-inherited.
+ *
+ * Parent tries to claim its own (non-inherited) context.
+ * Should fail with ENOENT since there's no inherited ctx.
+ */
+static int test_claim_noninherited(void)
+{
+	const size_t region_size = page_size;
+	struct fault_ops_bpf *skel = NULL;
+	struct bpf_link *link = NULL;
+	void *region = MAP_FAILED;
+	int ret = -1;
+	int fd;
+
+	printf("TEST: claim non-inherited returns error ... ");
+	fflush(stdout);
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	skel = fault_ops_bpf__open_and_load();
+	if (!skel) {
+		fprintf(stderr, "Failed to load BPF skeleton\n");
+		goto out;
+	}
+
+	link = bpf_map__attach_fault_ops(skel->maps.bench_fault_ops,
+					 region, region_size, 0);
+	if (!link) {
+		fprintf(stderr, "Failed to attach fault_ops: %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	/* Try to claim in the parent — no inherited ctx exists */
+	fd = bpf_link_fault_claim(bpf_link__fd(link));
+	if (fd >= 0) {
+		fprintf(stderr, "    FAIL: claim should have failed\n");
+		close(fd);
+		goto out;
+	}
+
+	if (errno != ENOENT) {
+		fprintf(stderr, "    FAIL: expected ENOENT, got %s\n",
+			strerror(errno));
+		goto out;
+	}
+
+	ret = 0;
+	printf("PASS\n");
+
+out:
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		fault_ops_bpf__destroy(skel);
+	if (region != MAP_FAILED)
+		munmap(region, region_size);
+	return ret;
+}
+
+/*
  * Test 7: Inherit multi-region.
  *
  * Parent registers multiple regions with INHERIT.
@@ -652,7 +835,11 @@ int main(void)
 		failed++;
 	if (test_inherit_multi_region() < 0)
 		failed++;
+	if (test_claim() < 0)
+		failed++;
+	if (test_claim_noninherited() < 0)
+		failed++;
 
-	printf("\n%d/%d tests passed\n", 7 - failed, 7);
+	printf("\n%d/%d tests passed\n", 9 - failed, 9);
 	return failed ? 1 : 0;
 }
