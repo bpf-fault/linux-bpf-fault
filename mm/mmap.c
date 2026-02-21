@@ -1722,6 +1722,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	int retval;
 	unsigned long charge = 0;
 	LIST_HEAD(uf);
+	LIST_HEAD(bf);
 	VMA_ITERATOR(vmi, mm, 0);
 
 	if (mmap_write_lock_killable(oldmm))
@@ -1784,7 +1785,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 		if (retval)
 			goto fail_nomem_policy;
 		tmp->vm_mm = mm;
-		retval = dup_userfaultfd(tmp, &uf);
+		retval = dup_userfaultfd(tmp, &uf, &bf);
 		if (retval)
 			goto fail_nomem_anon_vma_fork;
 		if (tmp->vm_flags & VM_WIPEONFORK) {
@@ -1872,10 +1873,13 @@ out:
 	mmap_write_unlock(mm);
 	flush_tlb_mm(oldmm);
 	mmap_write_unlock(oldmm);
-	if (!retval)
+	if (!retval) {
 		dup_userfaultfd_complete(&uf);
-	else
+		dup_bpf_fault_complete(&bf);
+	} else {
 		dup_userfaultfd_fail(&uf);
+		dup_bpf_fault_fail(&bf);
+	}
 	return retval;
 
 fail_nomem_anon_vma_fork:

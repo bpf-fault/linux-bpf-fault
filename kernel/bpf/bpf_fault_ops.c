@@ -151,7 +151,7 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 	struct bpf_map *map;
 	int err;
 
-	if (attr->link_create.fault.flags & ~BPF_FAULT_FLAG_WP)
+	if (attr->link_create.fault.flags & ~(BPF_FAULT_FLAG_WP | BPF_FAULT_FLAG_INHERIT))
 		return -EINVAL;
 
 	map = bpf_map_get(attr->link_create.map_fd);
@@ -336,3 +336,46 @@ out_put_link:
 /*
  * Allocate a lightweight link for a fork-inherited bpf_fault context.
  * Shares the parent's struct_ops map via bpf_map_inc().  The returned
+ * link has no bpf_link lifecycle (no fd, no bpf_link_init) — only the
+ * map pointer is populated, which is all bpf_fault_ops_map() needs.
+ */
+struct bpf_fault_ops_link *bpf_fault_ops_link_alloc_inherited(
+		struct bpf_fault_ops_link *parent_link)
+{
+	struct bpf_fault_ops_link *child_link;
+	struct bpf_map *map;
+
+	child_link = kzalloc(sizeof(*child_link), GFP_KERNEL);
+	if (!child_link)
+		return NULL;
+
+	rcu_read_lock();
+	map = rcu_dereference(parent_link->map);
+	if (map)
+		bpf_map_inc(map);
+	rcu_read_unlock();
+
+	if (!map) {
+		kfree(child_link);
+		return NULL;
+	}
+
+	RCU_INIT_POINTER(child_link->map, map);
+	return child_link;
+}
+
+/*
+ * Free an inherited link and its map reference.
+ */
+void bpf_fault_ops_link_free_inherited(struct bpf_fault_ops_link *link)
+{
+	struct bpf_map *map;
+
+	if (!link)
+		return;
+
+	map = rcu_dereference_protected(link->map, true);
+	if (map)
+		bpf_map_put(map);
+	kfree(link);
+}

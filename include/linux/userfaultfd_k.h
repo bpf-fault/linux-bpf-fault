@@ -39,6 +39,8 @@ struct bpf_fault_ctx {
 	unsigned int flags;
 	/* released */
 	bool released;
+	/* true for fork-inherited ctx (lightweight, no fd) */
+	bool inherited;
 	/* mm with one or more vmas attached to this bpf_fault_ctx */
 	struct mm_struct *mm;
 	/* bpf link attached to this bpf_fault_ctx */
@@ -77,6 +79,22 @@ int bpf_fault_unregister(struct bpf_fault_ctx *ctx, __u64 start, __u64 len);
 int bpf_fault_wp_range(struct mm_struct *mm, unsigned long start,
 		       unsigned long len, bool enable_wp);
 void bpf_fault_release_all(struct bpf_fault_ctx *ctx);
+
+#ifdef CONFIG_BPF_FAULT
+struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
+						  struct bpf_fault_ctx *parent);
+void bpf_fault_exit_mm(struct mm_struct *mm);
+struct bpf_fault_ops_link *bpf_fault_ops_link_alloc_inherited(
+		struct bpf_fault_ops_link *parent_link);
+void bpf_fault_ops_link_free_inherited(struct bpf_fault_ops_link *link);
+#else
+static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(
+		struct mm_struct *mm, struct bpf_fault_ctx *parent)
+{
+	return NULL;
+}
+static inline void bpf_fault_exit_mm(struct mm_struct *mm) {}
+#endif
 
 /*
  * Start with fault_pending_wqh and fault_wqh so they're more likely
@@ -307,9 +325,12 @@ static inline bool vma_has_uffd_without_event_remap(struct vm_area_struct *vma)
 	return uffd_ctx && (uffd_ctx->features & UFFD_FEATURE_EVENT_REMAP) == 0;
 }
 
-extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
+extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *,
+			  struct list_head *);
 extern void dup_userfaultfd_complete(struct list_head *);
 void dup_userfaultfd_fail(struct list_head *);
+void dup_bpf_fault_complete(struct list_head *);
+void dup_bpf_fault_fail(struct list_head *);
 
 extern void mremap_userfaultfd_prep(struct vm_area_struct *,
 				    struct vm_userfaultfd_ctx *);
@@ -366,6 +387,7 @@ static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 }
 
 static inline void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx) {}
+static inline void bpf_fault_exit_mm(struct mm_struct *mm) {}
 
 /* mm helpers */
 static inline vm_fault_t handle_userfault(struct vm_fault *vmf,
@@ -421,7 +443,8 @@ static inline bool userfaultfd_armed(struct vm_area_struct *vma)
 }
 
 static inline int dup_userfaultfd(struct vm_area_struct *vma,
-				  struct list_head *l)
+				  struct list_head *l,
+				  struct list_head *bf)
 {
 	return 0;
 }
@@ -431,6 +454,14 @@ static inline void dup_userfaultfd_complete(struct list_head *l)
 }
 
 static inline void dup_userfaultfd_fail(struct list_head *l)
+{
+}
+
+static inline void dup_bpf_fault_complete(struct list_head *l)
+{
+}
+
+static inline void dup_bpf_fault_fail(struct list_head *l)
 {
 }
 

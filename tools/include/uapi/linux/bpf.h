@@ -1167,6 +1167,7 @@ enum bpf_link_type {
 
 /* Flags for BPF_LINK_CREATE with BPF_LINK_TYPE_FAULT_OPS */
 #define BPF_FAULT_FLAG_WP	(1U << 0)
+#define BPF_FAULT_FLAG_INHERIT	(1U << 1)
 
 enum bpf_perf_event_type {
 	BPF_PERF_EVENT_UNSPEC = 0,

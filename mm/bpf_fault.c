@@ -503,9 +503,42 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	refcount_set(&ctx->refcount, 1);
 	ctx->flags = 0;
 	ctx->released = false;
+	ctx->inherited = false;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
 	mmgrab(ctx->mm);
+
+	return ctx;
+}
+
+/*
+ * Allocate a bpf_fault_ctx for a fork child, sharing the parent's
+ * struct_ops map.  The child gets its own lightweight link that
+ * holds a reference on the map but has no fd or bpf_link lifecycle.
+ */
+struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
+						  struct bpf_fault_ctx *parent)
+{
+	struct bpf_fault_ops_link *child_link;
+	struct bpf_fault_ctx *ctx;
+
+	ctx = kmem_cache_alloc(bpf_fault_ctx_cachep, GFP_KERNEL);
+	if (!ctx)
+		return NULL;
+
+	child_link = bpf_fault_ops_link_alloc_inherited(parent->prog);
+	if (!child_link) {
+		kmem_cache_free(bpf_fault_ctx_cachep, ctx);
+		return NULL;
+	}
+
+	refcount_set(&ctx->refcount, 1);
+	ctx->flags = parent->flags;
+	ctx->released = false;
+	ctx->inherited = true;
+	ctx->mm = mm;
+	mmgrab(mm);
+	ctx->prog = child_link;
 
 	return ctx;
 }
@@ -515,9 +548,51 @@ void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx)
 	if (!ctx)
 		return;
 
+	if (ctx->inherited)
+		bpf_fault_ops_link_free_inherited(ctx->prog);
+
 	if (ctx->mm)
 		mmdrop(ctx->mm);
 	kmem_cache_free(bpf_fault_ctx_cachep, ctx);
+}
+
+/*
+ * Clean up inherited bpf_fault contexts when an mm is torn down.
+ * Non-inherited contexts are cleaned up by the link fd close path,
+ * but inherited contexts have no fd and must be cleaned up here.
+ */
+void bpf_fault_exit_mm(struct mm_struct *mm)
+{
+	struct bpf_fault_ctx *ctxs[16];
+	struct vm_area_struct *vma;
+	int nr = 0, i;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	/*
+	 * Collect unique inherited bpf_fault_ctx pointers.  The mm is
+	 * being torn down so no other threads can be modifying VMAs.
+	 */
+	for_each_vma(vmi, vma) {
+		struct bpf_fault_ctx *ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+
+		if (!ctx || !ctx->inherited)
+			continue;
+
+		/* Deduplicate */
+		for (i = 0; i < nr; i++)
+			if (ctxs[i] == ctx)
+				break;
+		if (i < nr)
+			continue;
+
+		if (nr < ARRAY_SIZE(ctxs))
+			ctxs[nr++] = ctx;
+	}
+
+	for (i = 0; i < nr; i++) {
+		bpf_fault_release_all(ctxs[i]);
+		bpf_fault_ctx_put(ctxs[i]);
+	}
 }
 
 static __always_inline int bpf_fault_validate_range(struct mm_struct *mm,

@@ -20,6 +20,9 @@
 #ifndef BPF_FAULT_FLAG_WP
 #define BPF_FAULT_FLAG_WP	(1U << 0)
 #endif
+#ifndef BPF_FAULT_FLAG_INHERIT
+#define BPF_FAULT_FLAG_INHERIT	(1U << 1)
+#endif
 #ifndef BPF_FAULT_WP_ENABLE
 #define BPF_FAULT_WP_ENABLE	(1U << 0)
 #endif

@@ -24,6 +24,7 @@
 #include <linux/bug.h>
 #include <linux/anon_inodes.h>
 #include <linux/syscalls.h>
+#include <linux/bpf.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/mempolicy.h>
 #include <linux/ioctl.h>
@@ -61,6 +62,12 @@ struct userfaultfd_unmap_ctx {
 	struct userfaultfd_ctx *ctx;
 	unsigned long start;
 	unsigned long end;
+	struct list_head list;
+};
+
+struct bpf_fault_fork_ctx {
+	struct bpf_fault_ctx *orig;
+	struct bpf_fault_ctx *child;
 	struct list_head list;
 };
 
@@ -613,22 +620,54 @@ static void userfaultfd_event_complete(struct userfaultfd_ctx *ctx,
 	__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
 }
 
-int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
+int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs,
+		    struct list_head *bf_fcs)
 {
 	struct userfaultfd_ctx *ctx = NULL, *octx;
 	struct userfaultfd_fork_ctx *fctx;
 
-	/*
-	 * TODO: implement bpf_fault inheritance on fork.  For now,
-	 * strip VM_BPF_FAULT from child VMAs to avoid type-confusing
-	 * the bpf_fault_ctx pointer with a userfaultfd_ctx pointer
-	 * and to prevent the child from faulting against a context
-	 * bound to the parent mm.
-	 */
 	if (vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP)) {
-		vma_start_write(vma);
-		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
-		vm_flags_clear(vma, VM_BPF_FAULT | VM_BPF_FAULT_WP);
+		struct bpf_fault_ctx *bctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+
+		if (!bctx || !(bctx->flags & BPF_FAULT_FLAG_INHERIT)) {
+			/* No inheritance: strip bpf_fault from child */
+			vma_start_write(vma);
+			vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
+			vm_flags_clear(vma, VM_BPF_FAULT | VM_BPF_FAULT_WP);
+			return 0;
+		}
+
+		/* INHERIT: deduplicate child ctx across VMAs */
+		{
+			struct bpf_fault_fork_ctx *bfctx;
+			struct bpf_fault_ctx *child_ctx = NULL;
+
+			list_for_each_entry(bfctx, bf_fcs, list) {
+				if (bfctx->orig == bctx) {
+					child_ctx = bfctx->child;
+					break;
+				}
+			}
+
+			if (!child_ctx) {
+				bfctx = kmalloc(sizeof(*bfctx), GFP_KERNEL);
+				if (!bfctx)
+					return -ENOMEM;
+
+				child_ctx = bpf_fault_ctx_alloc_for_mm(
+						vma->vm_mm, bctx);
+				if (!child_ctx) {
+					kfree(bfctx);
+					return -ENOMEM;
+				}
+
+				bfctx->orig = bctx;
+				bfctx->child = child_ctx;
+				list_add_tail(&bfctx->list, bf_fcs);
+			}
+
+			vma->vm_userfaultfd_ctx.bpf_ctx = child_ctx;
+		}
 		return 0;
 	}
 
@@ -729,6 +768,27 @@ void dup_userfaultfd_fail(struct list_head *fcs)
 
 		list_del(&fctx->list);
 		kfree(fctx);
+	}
+}
+
+void dup_bpf_fault_complete(struct list_head *bf_fcs)
+{
+	struct bpf_fault_fork_ctx *bfctx, *n;
+
+	list_for_each_entry_safe(bfctx, n, bf_fcs, list) {
+		list_del(&bfctx->list);
+		kfree(bfctx);
+	}
+}
+
+void dup_bpf_fault_fail(struct list_head *bf_fcs)
+{
+	struct bpf_fault_fork_ctx *bfctx, *n;
+
+	list_for_each_entry_safe(bfctx, n, bf_fcs, list) {
+		bpf_fault_ctx_put(bfctx->child);
+		list_del(&bfctx->list);
+		kfree(bfctx);
 	}
 }
 
