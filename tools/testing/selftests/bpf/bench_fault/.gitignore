@@ -5,6 +5,8 @@
 /test_wp_fault
 /bench_fault_wp
 /test_sigbus_fault
+/test_fork_fault
+/test_multi_region
 /*.bpf.o
 /*.skel.h
 /vmlinux.h
