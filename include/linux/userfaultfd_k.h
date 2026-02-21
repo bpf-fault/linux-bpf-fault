@@ -39,8 +39,8 @@ struct bpf_fault_ctx {
 	unsigned int flags;
 	/* released */
 	bool released;
-	/* true for fork-inherited ctx (lightweight, no fd) */
-	bool inherited;
+	/* 1 for fork-inherited ctx (lightweight, no fd), cleared via xchg */
+	int inherited;
 	/* parent's bpf_link ID, set during fork for inherited contexts */
 	u32 parent_link_id;
 	/* mm with one or more vmas attached to this bpf_fault_ctx */

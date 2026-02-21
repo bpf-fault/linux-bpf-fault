@@ -373,11 +373,17 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 		goto out_put_parent;
 	}
 
+	/* Atomically claim — only one thread wins the race */
+	if (!xchg(&ctx->inherited, 0)) {
+		err = -EBUSY;
+		goto out_put_parent;
+	}
+
 	/* Allocate a proper link for this ctx */
 	new_link = kzalloc(sizeof(*new_link), GFP_USER);
 	if (!new_link) {
 		err = -ENOMEM;
-		goto out_put_parent;
+		goto out_unclaim;
 	}
 
 	bpf_link_init(&new_link->link, BPF_LINK_TYPE_FAULT_OPS,
@@ -385,7 +391,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 
 	err = bpf_link_prime(&new_link->link, &primer);
 	if (err)
-		goto out_put_parent;
+		goto out_unclaim;
 
 	/* Transfer the map reference from the lightweight link */
 	rcu_read_lock();
@@ -398,7 +404,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 		bpf_link_cleanup(&primer);
 		new_link = NULL;
 		err = -ENOENT;
-		goto out_put_parent;
+		goto out_unclaim;
 	}
 
 	/* Register with struct_ops */
@@ -411,7 +417,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 		bpf_map_put(map);
 		bpf_link_cleanup(&primer);
 		new_link = NULL;
-		goto out_put_parent;
+		goto out_unclaim;
 	}
 
 	RCU_INIT_POINTER(new_link->map, map);
@@ -420,12 +426,14 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 	/* Free the old lightweight link, replace with proper one */
 	bpf_fault_ops_link_free_inherited(ctx->prog);
 	ctx->prog = new_link;
-	ctx->inherited = false;
 	ctx->parent_link_id = 0;
 
 	bpf_link_put(parent_link);
 	return bpf_link_settle(&primer);
 
+out_unclaim:
+	/* Restore inherited so cleanup paths and retries still work */
+	WRITE_ONCE(ctx->inherited, 1);
 out_put_parent:
 	kfree(new_link);
 	bpf_link_put(parent_link);

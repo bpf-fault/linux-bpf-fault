@@ -503,7 +503,7 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	refcount_set(&ctx->refcount, 1);
 	ctx->flags = 0;
 	ctx->released = false;
-	ctx->inherited = false;
+	ctx->inherited = 0;
 	ctx->parent_link_id = 0;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
@@ -536,7 +536,7 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
 	refcount_set(&ctx->refcount, 1);
 	ctx->flags = parent->flags;
 	ctx->released = false;
-	ctx->inherited = true;
+	ctx->inherited = 1;
 	ctx->parent_link_id = 0;
 	ctx->mm = mm;
 	mmgrab(mm);
