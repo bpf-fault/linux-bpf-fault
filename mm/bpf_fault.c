@@ -504,6 +504,7 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	ctx->flags = 0;
 	ctx->released = false;
 	ctx->inherited = false;
+	ctx->parent_link_id = 0;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
 	mmgrab(ctx->mm);
@@ -536,11 +537,37 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
 	ctx->flags = parent->flags;
 	ctx->released = false;
 	ctx->inherited = true;
+	ctx->parent_link_id = 0;
 	ctx->mm = mm;
 	mmgrab(mm);
 	ctx->prog = child_link;
 
 	return ctx;
+}
+
+/*
+ * Find an inherited bpf_fault_ctx in the given mm that was forked from
+ * the parent link with the specified ID.  Returns the ctx with the
+ * mmap read lock released, or NULL if not found.
+ */
+struct bpf_fault_ctx *bpf_fault_find_inherited_ctx(struct mm_struct *mm,
+						   u32 parent_link_id)
+{
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	mmap_read_lock(mm);
+	for_each_vma(vmi, vma) {
+		struct bpf_fault_ctx *ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+
+		if (ctx && ctx->inherited &&
+		    ctx->parent_link_id == parent_link_id) {
+			mmap_read_unlock(mm);
+			return ctx;
+		}
+	}
+	mmap_read_unlock(mm);
+	return NULL;
 }
 
 void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx)

@@ -1899,6 +1899,7 @@ union bpf_attr {
 #define BPF_FAULT_WP_ENABLE	(1U << 0)
 #define BPF_FAULT_REGISTER	(1U << 1)
 #define BPF_FAULT_UNREGISTER	(1U << 2)
+#define BPF_FAULT_CLAIM		(1U << 3)
 
 /* The description below is an attempt at providing documentation to eBPF
  * developers about the multiple available eBPF helper functions. It can be

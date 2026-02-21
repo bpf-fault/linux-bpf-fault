@@ -13319,6 +13319,19 @@ int bpf_link__fault_unregister(int link_fd, __u64 start, __u64 len)
 	return libbpf_err_errno(ret);
 }
 
+int bpf_link__fault_claim(int parent_link_fd)
+{
+	const size_t attr_sz = offsetofend(union bpf_attr, link_fault_cmd);
+	union bpf_attr attr;
+
+	memset(&attr, 0, attr_sz);
+	attr.link_fault_cmd.link_fd = parent_link_fd;
+	attr.link_fault_cmd.flags = BPF_FAULT_CLAIM;
+
+	return libbpf_err_errno(syscall(__NR_bpf, BPF_LINK_FAULT_OPS_CMD,
+					&attr, attr_sz));
+}
+
 typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(struct perf_event_header *hdr,
 							  void *private_data);
 

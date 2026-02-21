@@ -6009,6 +6009,8 @@ static int link_fault_ops_cmd(union bpf_attr *attr)
 		return bpf_fault_ops_link_add_region(attr);
 	if (flags & BPF_FAULT_UNREGISTER)
 		return bpf_fault_ops_link_remove_region(attr);
+	if (flags & BPF_FAULT_CLAIM)
+		return bpf_fault_ops_link_claim(attr);
 
 	/* BPF_FAULT_WP_ENABLE or 0 (resolve) → writeprotect path */
 	return bpf_fault_ops_link_writeprotect(attr);

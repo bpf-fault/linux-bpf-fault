@@ -660,6 +660,8 @@ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs,
 					kfree(bfctx);
 					return -ENOMEM;
 				}
+				child_ctx->parent_link_id =
+					bpf_fault_ops_link_id(bctx->prog);
 
 				bfctx->orig = bctx;
 				bfctx->child = child_ctx;

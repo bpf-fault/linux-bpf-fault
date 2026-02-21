@@ -905,6 +905,7 @@ bpf_map__attach_fault_ops(const struct bpf_map *map, void *start,
 
 LIBBPF_API int bpf_link__fault_register(int link_fd, __u64 start, __u64 len);
 LIBBPF_API int bpf_link__fault_unregister(int link_fd, __u64 start, __u64 len);
+LIBBPF_API int bpf_link__fault_claim(int parent_link_fd);
 
 struct bpf_iter_attach_opts {
 	size_t sz; /* size of this struct for forward/backward compatibility */

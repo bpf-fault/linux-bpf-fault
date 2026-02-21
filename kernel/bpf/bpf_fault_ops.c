@@ -22,6 +22,11 @@ struct bpf_fault_ops_link {
 	struct bpf_fault_ctx *ctx;
 };
 
+u32 bpf_fault_ops_link_id(struct bpf_fault_ops_link *link)
+{
+	return link->link.id;
+}
+
 struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link)
 {
 	struct bpf_struct_ops_map *st_map;
@@ -330,6 +335,101 @@ int bpf_fault_ops_link_remove_region(union bpf_attr *attr)
 
 out_put_link:
 	bpf_link_put(link);
+	return err;
+}
+
+/*
+ * Claim an inherited bpf_fault context in the current process.
+ *
+ * After fork with BPF_FAULT_FLAG_INHERIT, the child has an inherited
+ * context with no bpf_link lifecycle.  This command creates a proper
+ * bpf_link for the child's context using the standard bpf_link_prime/
+ * bpf_link_settle path, returning a new fd.
+ */
+int bpf_fault_ops_link_claim(union bpf_attr *attr)
+{
+	struct bpf_fault_ops_link *new_link;
+	struct bpf_link_primer primer;
+	struct bpf_fault_ctx *ctx;
+	struct bpf_struct_ops_map *st_map;
+	struct bpf_link *parent_link;
+	struct bpf_map *map;
+	int err;
+
+	/* Get the parent's bpf_link from the inherited fd */
+	parent_link = bpf_link_get_from_fd(attr->link_fault_cmd.link_fd);
+	if (IS_ERR(parent_link))
+		return PTR_ERR(parent_link);
+
+	if (parent_link->type != BPF_LINK_TYPE_FAULT_OPS) {
+		err = -EINVAL;
+		goto out_put_parent;
+	}
+
+	/* Search current->mm for an inherited ctx matching this parent */
+	ctx = bpf_fault_find_inherited_ctx(current->mm, parent_link->id);
+	if (!ctx) {
+		err = -ENOENT;
+		goto out_put_parent;
+	}
+
+	/* Allocate a proper link for this ctx */
+	new_link = kzalloc(sizeof(*new_link), GFP_USER);
+	if (!new_link) {
+		err = -ENOMEM;
+		goto out_put_parent;
+	}
+
+	bpf_link_init(&new_link->link, BPF_LINK_TYPE_FAULT_OPS,
+		      &bpf_fault_ops_link_lops, NULL, 0);
+
+	err = bpf_link_prime(&new_link->link, &primer);
+	if (err) {
+		kfree(new_link);
+		goto out_put_parent;
+	}
+
+	/* Transfer the map reference from the lightweight link */
+	rcu_read_lock();
+	map = rcu_dereference(ctx->prog->map);
+	if (map)
+		bpf_map_inc(map);
+	rcu_read_unlock();
+
+	if (!map) {
+		bpf_link_cleanup(&primer);
+		kfree(new_link);
+		err = -ENOENT;
+		goto out_put_parent;
+	}
+
+	/* Register with struct_ops */
+	st_map = container_of(map, struct bpf_struct_ops_map, map);
+	mutex_lock(&fault_update_mutex);
+	err = st_map->st_ops_desc->st_ops->reg(st_map->kvalue.data,
+						&new_link->link);
+	mutex_unlock(&fault_update_mutex);
+	if (err) {
+		bpf_map_put(map);
+		bpf_link_cleanup(&primer);
+		kfree(new_link);
+		goto out_put_parent;
+	}
+
+	RCU_INIT_POINTER(new_link->map, map);
+	new_link->ctx = ctx;
+
+	/* Free the old lightweight link, replace with proper one */
+	bpf_fault_ops_link_free_inherited(ctx->prog);
+	ctx->prog = new_link;
+	ctx->inherited = false;
+	ctx->parent_link_id = 0;
+
+	bpf_link_put(parent_link);
+	return bpf_link_settle(&primer);
+
+out_put_parent:
+	bpf_link_put(parent_link);
 	return err;
 }
 
