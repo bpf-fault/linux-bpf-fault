@@ -590,35 +590,23 @@ void bpf_fault_ctx_free(struct bpf_fault_ctx *ctx)
  */
 void bpf_fault_exit_mm(struct mm_struct *mm)
 {
-	struct bpf_fault_ctx *ctxs[16];
 	struct vm_area_struct *vma;
-	int nr = 0, i;
 	VMA_ITERATOR(vmi, mm, 0);
 
 	/*
-	 * Collect unique inherited bpf_fault_ctx pointers.  The mm is
-	 * being torn down so no other threads can be modifying VMAs.
+	 * Walk all VMAs and clean up inherited bpf_fault contexts.
+	 * Multiple VMAs may share the same ctx — bpf_fault_release_all()
+	 * sets ctx->released as its first action, which serves as a
+	 * natural deduplication marker for subsequent VMAs.
 	 */
 	for_each_vma(vmi, vma) {
 		struct bpf_fault_ctx *ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
 
-		if (!ctx || !ctx->inherited)
+		if (!ctx || !ctx->inherited || ctx->released)
 			continue;
 
-		/* Deduplicate */
-		for (i = 0; i < nr; i++)
-			if (ctxs[i] == ctx)
-				break;
-		if (i < nr)
-			continue;
-
-		if (nr < ARRAY_SIZE(ctxs))
-			ctxs[nr++] = ctx;
-	}
-
-	for (i = 0; i < nr; i++) {
-		bpf_fault_release_all(ctxs[i]);
-		bpf_fault_ctx_put(ctxs[i]);
+		bpf_fault_release_all(ctx);
+		bpf_fault_ctx_put(ctx);
 	}
 }
 
