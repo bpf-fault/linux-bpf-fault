@@ -348,7 +348,7 @@ out_put_link:
  */
 int bpf_fault_ops_link_claim(union bpf_attr *attr)
 {
-	struct bpf_fault_ops_link *new_link;
+	struct bpf_fault_ops_link *new_link = NULL;
 	struct bpf_link_primer primer;
 	struct bpf_fault_ctx *ctx;
 	struct bpf_struct_ops_map *st_map;
@@ -384,10 +384,8 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 		      &bpf_fault_ops_link_lops, NULL, 0);
 
 	err = bpf_link_prime(&new_link->link, &primer);
-	if (err) {
-		kfree(new_link);
+	if (err)
 		goto out_put_parent;
-	}
 
 	/* Transfer the map reference from the lightweight link */
 	rcu_read_lock();
@@ -398,7 +396,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 
 	if (!map) {
 		bpf_link_cleanup(&primer);
-		kfree(new_link);
+		new_link = NULL;
 		err = -ENOENT;
 		goto out_put_parent;
 	}
@@ -412,7 +410,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 	if (err) {
 		bpf_map_put(map);
 		bpf_link_cleanup(&primer);
-		kfree(new_link);
+		new_link = NULL;
 		goto out_put_parent;
 	}
 
@@ -429,6 +427,7 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 	return bpf_link_settle(&primer);
 
 out_put_parent:
+	kfree(new_link);
 	bpf_link_put(parent_link);
 	return err;
 }
