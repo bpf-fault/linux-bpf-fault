@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-This is a Linux 6.17 kernel tree with an in-development feature: **bpf_fault** — a BPF struct_ops-based page fault handler that allows BPF programs to intercept and handle anonymous page faults as an alternative to userfaultfd. The feature supports anonymous missing faults, shmem missing/minor faults, write-protect (WP) faults, and SIGBUS delivery.
+This is a Linux 6.17 kernel tree with an in-development feature: **bpf_fault** — a BPF struct_ops-based page fault handler that allows BPF programs to intercept and handle anonymous page faults as an alternative to userfaultfd. The feature supports anonymous missing faults, shmem missing/minor faults, write-protect (WP) faults, SIGBUS delivery, multi-region registration (add/remove regions to a single link), fork inheritance (`BPF_FAULT_FLAG_INHERIT`), and post-fork claim (`BPF_FAULT_CLAIM`).
 
 ## Build Commands
 
@@ -35,7 +35,7 @@ make -C tools/testing/selftests/bpf       # Build BPF selftests
 make -C tools/testing/selftests/bpf/bench_fault   # Build all bench_fault programs
 ```
 
-Targets: `bench_fault`, `bench_fault_scale`, `bench_fault_shmem`, `bench_fault_wp`, `test_shmem_fault`, `test_wp_fault`, `test_sigbus_fault`
+Targets: `bench_fault`, `bench_fault_scale`, `bench_fault_shmem`, `bench_fault_wp`, `test_shmem_fault`, `test_wp_fault`, `test_sigbus_fault`, `test_multi_region`, `test_fork_fault`
 
 ### bpftool
 ```bash
@@ -45,8 +45,9 @@ make -C tools/bpf/bpftool                 # Build bpftool
 ## bpf_fault Architecture
 
 ### Kernel-side components
-- **`mm/bpf_fault.c`** — Core fault handling: page table manipulation, VMA setup/teardown, fault context lifecycle (refcounted `bpf_fault_ctx`), `bpf_fault_handle_pte()` entry point, and WP fault support
-- **`kernel/bpf/bpf_fault_ops.c`** — BPF link type and struct_ops integration: `bpf_fault_ops_link` lifecycle, link create/update/detach, registration with the fault context
+- **`mm/bpf_fault.c`** — Core fault handling: page table manipulation, VMA setup/teardown, fault context lifecycle (refcounted `bpf_fault_ctx`), `bpf_fault_handle_pte()` entry point, WP fault support, multi-region register/unregister, fork inheritance (`bpf_fault_ctx_alloc_for_mm`, `bpf_fault_exit_mm`)
+- **`kernel/bpf/bpf_fault_ops.c`** — BPF link type and struct_ops integration: `bpf_fault_ops_link` lifecycle, link create/update/detach, registration with the fault context, multi-region command dispatch, inherited link allocation, post-fork claim (`bpf_fault_ops_link_claim`)
+- **`fs/userfaultfd.c`** — Fork path integration: `dup_userfaultfd()` handles bpf_fault inheritance via deduplication list (same pattern as userfaultfd fork contexts)
 - **`mm/memory.c`** — Primary integration point: calls into bpf_fault from the anonymous page fault handler
 - **`mm/shmem.c`** — shmem integration: intercepts missing/minor faults for shmem-backed VMAs
 - **`mm/huge_memory.c`** — THP integration: falls back from huge page collapse when bpf_fault is active
