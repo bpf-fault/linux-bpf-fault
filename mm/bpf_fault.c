@@ -143,7 +143,7 @@ void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
  *
  * Called from do_wp_page() with the PTE lock already released.  The BPF
  * program decides whether to allow the write (return 0) or deny it
- * (return non-zero → SIGBUS).
+ * (return non-zero -> SIGBUS).
  *
  * On allow: re-acquire VMA lock, re-walk page tables, clear the uffd-wp
  * bit on the PTE, and return VM_FAULT_RETRY so the fault retries and
