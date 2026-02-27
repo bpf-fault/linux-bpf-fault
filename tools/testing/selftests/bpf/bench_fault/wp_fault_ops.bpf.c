@@ -29,7 +29,8 @@ int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
 }
 
 SEC("struct_ops/handle_wp_fault")
-int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx)
+int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
+	     unsigned char *buf)
 {
 	__sync_fetch_and_add(&wp_fault_count, 1);
 	return 0;

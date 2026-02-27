@@ -722,7 +722,8 @@ struct bpf_fault_ops_ctx {
 struct fault_ops {
 	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
 				 unsigned char *page);
-	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx);
+	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx,
+			       unsigned char *page);
 };
 
 struct anon_vma_name {

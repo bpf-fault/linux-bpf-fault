@@ -157,7 +157,10 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long address = vmf->address;
+	struct folio *folio = NULL;
+	size_t folio_off = 0;
 	struct fault_ops *ops;
+	void *kaddr;
 	int err;
 
 	if (current->flags & (PF_EXITING | PF_DUMPCORE))
@@ -184,6 +187,52 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 
 	release_fault_lock(vmf);
 
+	/*
+	 * Look up the existing page so the BPF program can read its
+	 * contents.  The page is present (this is a WP fault), so walk
+	 * the page tables under VMA lock to get a folio reference.
+	 */
+	vma = bpf_fault_lock_vma(mm, address);
+	if (IS_ERR(vma)) {
+		ret = VM_FAULT_RETRY;
+		goto out_put_ctx;
+	}
+
+	if (bpf_fault_wp(vma)) {
+		pmd_t *pmd;
+		pte_t *ptep, pte;
+		spinlock_t *ptl;
+		struct page *page;
+
+		pmd = bpf_fault_alloc_pmd(mm, address);
+		if (!pmd)
+			goto out_no_page;
+
+		ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+		if (!ptep)
+			goto out_no_page;
+
+		pte = ptep_get(ptep);
+		if (pte_present(pte)) {
+			page = vm_normal_page(vma, address, pte);
+			if (page) {
+				folio = page_folio(page);
+				folio_off = folio_page_idx(folio, page) *
+					    PAGE_SIZE;
+				folio_get(folio);
+			}
+		}
+		pte_unmap_unlock(ptep, ptl);
+	}
+
+out_no_page:
+	bpf_fault_unlock_vma(vma);
+
+	if (folio)
+		kaddr = kmap_local_folio(folio, folio_off);
+	else
+		kaddr = NULL;
+
 	/* Set up BPF context and call the WP fault handler */
 	ops_ctx.address = vmf->address;
 	ops_ctx.real_address = vmf->real_address;
@@ -192,10 +241,15 @@ vm_fault_t handle_bpf_fault_wp(struct vm_fault *vmf)
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
 	if (ops->handle_wp_fault)
-		err = ops->handle_wp_fault(&ops_ctx);
+		err = ops->handle_wp_fault(&ops_ctx, kaddr);
 	else
 		err = -ENOSYS;
 	rcu_read_unlock();
+
+	if (kaddr)
+		kunmap_local(kaddr);
+	if (folio)
+		folio_put(folio);
 
 	if (err) {
 		/*
@@ -931,12 +985,15 @@ static bool bpf_fault_is_valid_access(int off, int size,
 		return false;
 
 	/*
-	 * For handle_page_fault: arg1 is the page pointer (writable
-	 * PTR_TO_MEM, PAGE_SIZE bounds).  handle_wp_fault has no
-	 * page pointer argument.
+	 * For handle_page_fault and handle_wp_fault: arg1 is the page
+	 * pointer (PTR_TO_MEM, PAGE_SIZE bounds).  For handle_page_fault
+	 * the page is writable; for handle_wp_fault it is read-only
+	 * (may also be NULL if the page table walk failed).
 	 */
-	if (!is_wp && off == sizeof(__u64)) {
-		info->reg_type = PTR_TO_MEM;
+	if (off == sizeof(__u64)) {
+		info->reg_type = is_wp ?
+			PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY :
+			PTR_TO_MEM;
 		info->mem_size = PAGE_SIZE;
 		return true;
 	}
@@ -1099,7 +1156,8 @@ static int __bpf_fault_handle_page_fault(struct bpf_fault_ops_ctx *ctx,
 	return 0;
 }
 
-static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx)
+static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx,
+				       unsigned char *page)
 {
 	return 0;
 }

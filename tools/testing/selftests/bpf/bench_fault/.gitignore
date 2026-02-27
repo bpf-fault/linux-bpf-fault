@@ -3,6 +3,7 @@
 /bench_fault_shmem
 /test_shmem_fault
 /test_wp_fault
+/test_wp_read_fault
 /bench_fault_wp
 /test_sigbus_fault
 /test_fork_fault

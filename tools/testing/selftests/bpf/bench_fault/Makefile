@@ -22,7 +22,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
-all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region test_fork_fault
+all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region test_fork_fault test_wp_read_fault
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -75,6 +75,16 @@ test_wp_fault: test_wp_fault.c wp_fault_ops.skel.h sigbus_fault_ops.skel.h $(LIB
 bench_fault_wp: bench_fault_wp.c wp_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+# WP read fault test: separate BPF program to verify page read access in WP handler
+wp_read_fault_ops.bpf.o: wp_read_fault_ops.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
+	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+
+wp_read_fault_ops.skel.h: wp_read_fault_ops.bpf.o $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+test_wp_read_fault: test_wp_read_fault.c wp_read_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
 # SIGBUS fault test: BPF handler that rejects missing faults
 sigbus_fault_ops.bpf.o: sigbus_fault_ops.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
 	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
@@ -95,8 +105,9 @@ test_fork_fault: test_fork_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 
 clean:
 	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
-		test_multi_region test_fork_fault \
+		test_multi_region test_fork_fault test_wp_read_fault \
 		fault_ops.bpf.o fault_ops.skel.h wp_fault_ops.bpf.o wp_fault_ops.skel.h \
+		wp_read_fault_ops.bpf.o wp_read_fault_ops.skel.h \
 		sigbus_fault_ops.bpf.o sigbus_fault_ops.skel.h \
 		vmlinux.h $(BUILD_DIR)
 
