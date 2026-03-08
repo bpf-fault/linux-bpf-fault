@@ -42,12 +42,18 @@ static long page_size;
 static int create_test_file(const char *path, size_t num_pages,
 			    unsigned char fill)
 {
-	char buf[4096];
+	char *buf;
 	int fd;
 
 	fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
 	if (fd < 0) {
 		perror("open");
+		return -1;
+	}
+
+	buf = malloc(page_size);
+	if (!buf) {
+		close(fd);
 		return -1;
 	}
 
@@ -57,6 +63,7 @@ static int create_test_file(const char *path, size_t num_pages,
 		memset(buf, c, page_size);
 		if (write(fd, buf, page_size) != page_size) {
 			perror("write");
+			free(buf);
 			close(fd);
 			unlink(path);
 			return -1;
@@ -65,6 +72,7 @@ static int create_test_file(const char *path, size_t num_pages,
 
 	/* Flush to disk so posix_fadvise DONTNEED actually works */
 	fsync(fd);
+	free(buf);
 	return fd;
 }
 

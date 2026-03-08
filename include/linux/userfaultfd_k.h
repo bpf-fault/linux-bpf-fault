@@ -318,7 +318,15 @@ static inline bool vma_can_bpf_fault(struct vm_area_struct *vma)
 	    vma_is_shmem(vma))
 		return true;
 
-	/* File-backed VMAs with a fault handler (ext4, xfs, etc.) */
+	/*
+	 * File-backed VMAs with a fault handler (ext4, xfs, etc.).
+	 * Exclude DAX: its fault handler bypasses the page cache and
+	 * returns VM_FAULT_NOPAGE, so the two-phase approach in
+	 * do_bpf_fault_file() would never invoke the BPF program.
+	 */
+	if (vma_is_dax(vma))
+		return false;
+
 	return vma->vm_ops && vma->vm_ops->fault;
 }
 

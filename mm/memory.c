@@ -5724,7 +5724,8 @@ static vm_fault_t do_bpf_fault_file(struct vm_fault *vmf)
 		return ret;
 
 	ret = __do_fault(vmf);
-	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
+			    VM_FAULT_DONE_COW)))
 		return ret;
 
 	/*
