@@ -2528,7 +2528,7 @@ repeat:
 	if (folio && vma && bpf_fault_missing(vma)) {
 		if (!xa_is_value(folio))
 			folio_put(folio);
-		*fault_type = handle_bpf_fault(vmf);
+		*fault_type = handle_bpf_fault(vmf, false);
 		return 0;
 	}
 
@@ -2581,7 +2581,7 @@ repeat:
 		return 0;
 	}
 	if (vma && bpf_fault_missing(vma)) {
-		*fault_type = handle_bpf_fault(vmf);
+		*fault_type = handle_bpf_fault(vmf, false);
 		return 0;
 	}
 

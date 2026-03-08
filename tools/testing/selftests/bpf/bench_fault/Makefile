@@ -22,7 +22,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
-all: bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region test_fork_fault test_wp_read_fault
+all: bench_fault bench_fault_scale bench_fault_shmem bench_fault_file test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region test_fork_fault test_wp_read_fault test_file_fault
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -57,6 +57,9 @@ bench_fault_scale: bench_fault_scale.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 bench_fault_shmem: bench_fault_shmem.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
+bench_fault_file: bench_fault_file.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 test_shmem_fault: test_shmem_fault.c fault_ops.skel.h sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
@@ -103,9 +106,13 @@ test_multi_region: test_multi_region.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 test_fork_fault: test_fork_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+# File-backed fault test
+test_file_fault: test_file_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
 clean:
 	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
-		test_multi_region test_fork_fault test_wp_read_fault \
+		test_multi_region test_fork_fault test_wp_read_fault test_file_fault bench_fault_file \
 		fault_ops.bpf.o fault_ops.skel.h wp_fault_ops.bpf.o wp_fault_ops.skel.h \
 		wp_read_fault_ops.bpf.o wp_read_fault_ops.skel.h \
 		sigbus_fault_ops.bpf.o sigbus_fault_ops.skel.h \

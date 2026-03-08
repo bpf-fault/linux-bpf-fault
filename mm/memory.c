@@ -5049,7 +5049,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		}
 		if (bpf_fault_missing(vma)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
-			return handle_bpf_fault(vmf);
+			return handle_bpf_fault(vmf, true);
 		}
 		goto setpte;
 	}
@@ -5071,7 +5071,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 						vmf->address, &vmf->ptl);
 		if (vmf->pte && !vmf_pte_changed(vmf)) {
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
-			return handle_bpf_fault(vmf);
+			return handle_bpf_fault(vmf, true);
 		}
 		if (vmf->pte)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -5125,7 +5125,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	if (bpf_fault_missing(vma)) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(folio);
-		return handle_bpf_fault(vmf);
+		return handle_bpf_fault(vmf, true);
 	}
 
 	folio_ref_add(folio, nr_pages - 1);
@@ -5705,6 +5705,43 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
 }
 
 /*
+ * Handle a file-backed fault on a VMA registered with bpf_fault.
+ *
+ * Phase 1: let the filesystem populate the page cache via __do_fault()
+ * (handles both cache hits and cache misses transparently).
+ *
+ * Phase 2: hand off to handle_bpf_fault() which copies the cached data
+ * into a private folio, calls the BPF program to intercept/modify it,
+ * and installs it as an anonymous page (correct for MAP_PRIVATE).
+ */
+static vm_fault_t do_bpf_fault_file(struct vm_fault *vmf)
+{
+	struct folio *folio;
+	vm_fault_t ret;
+
+	ret = vmf_can_call_fault(vmf);
+	if (ret)
+		return ret;
+
+	ret = __do_fault(vmf);
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+		return ret;
+
+	/*
+	 * The filesystem has populated the page cache and returned a
+	 * locked folio reference.  Release it — handle_bpf_fault() will
+	 * re-find it via filemap_lock_folio(mapping, pgoff) and copy
+	 * the data into a private folio for the BPF program.
+	 */
+	folio = page_folio(vmf->page);
+	folio_unlock(folio);
+	folio_put(folio);
+	vmf->page = NULL;
+
+	return handle_bpf_fault(vmf, true);
+}
+
+/*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults).
  * The mmap_lock may have been released depending on flags and our
@@ -5741,6 +5778,8 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 		}
+	} else if (bpf_fault_missing(vma)) {
+		ret = do_bpf_fault_file(vmf);
 	} else if (!(vmf->flags & FAULT_FLAG_WRITE))
 		ret = do_read_fault(vmf);
 	else if (!(vma->vm_flags & VM_SHARED))

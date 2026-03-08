@@ -309,7 +309,7 @@ out:
 	return ret;
 }
 
-vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
+vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 {
 	struct bpf_fault_ctx *ctx;
 	struct bpf_fault_ops_ctx ops_ctx;
@@ -505,17 +505,19 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf)
 	if (err) {
 		folio_put(folio);
 		ret = VM_FAULT_RETRY;
-	} else if (!mapping) {
+	} else if (can_complete) {
 		/*
-		 * Anonymous fault: PTE installed and VMA lock released.
+		 * Direct callers (anon page faults, file-backed faults
+		 * from do_fault): PTE installed and VMA lock released.
 		 * Return COMPLETED so the arch fault code skips the
 		 * retry, avoiding a redundant VMA lookup + page table
 		 * walk just to find the PTE present.
 		 *
-		 * File-backed (shmem) faults must use RETRY because
-		 * the intermediate callers (__do_fault, shmem_fault)
-		 * don't handle COMPLETED and would try to process a
-		 * folio that doesn't exist.
+		 * Callers nested inside filesystem fault handlers
+		 * (e.g. shmem_fault → __do_fault) must use RETRY
+		 * because the intermediate callers don't handle
+		 * COMPLETED and would try to process a folio that
+		 * doesn't exist.
 		 */
 		ret = VM_FAULT_COMPLETED;
 	} else {
@@ -748,8 +750,8 @@ static int __bpf_fault_register_range(struct bpf_fault_ctx *ctx,
 		if (!vma_can_bpf_fault(cur))
 			goto out_unlock;
 
-		/* Shared shmem not yet supported (needs file rmap). */
-		if (vma_is_shmem(cur) && (cur->vm_flags & VM_SHARED))
+		/* Shared file-backed VMAs not yet supported (needs file rmap). */
+		if (!vma_is_anonymous(cur) && (cur->vm_flags & VM_SHARED))
 			goto out_unlock;
 
 		/*
