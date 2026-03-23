@@ -1,6 +1,7 @@
 /bench_fault
 /bench_fault_scale
 /bench_fault_shmem
+/bench_fault_file
 /test_shmem_fault
 /test_wp_fault
 /test_wp_read_fault
