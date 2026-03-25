@@ -614,8 +614,12 @@ struct bpf_fault_ctx *bpf_fault_find_inherited_ctx(struct mm_struct *mm,
 
 	mmap_read_lock(mm);
 	for_each_vma(vmi, vma) {
-		struct bpf_fault_ctx *ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+		struct bpf_fault_ctx *ctx;
 
+		if (!bpf_fault_set(vma))
+			continue;
+
+		ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
 		if (ctx && ctx->inherited &&
 		    ctx->parent_link_id == parent_link_id) {
 			mmap_read_unlock(mm);
@@ -656,8 +660,12 @@ void bpf_fault_exit_mm(struct mm_struct *mm)
 	 * natural deduplication marker for subsequent VMAs.
 	 */
 	for_each_vma(vmi, vma) {
-		struct bpf_fault_ctx *ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+		struct bpf_fault_ctx *ctx;
 
+		if (!bpf_fault_set(vma))
+			continue;
+
+		ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
 		if (!ctx || !ctx->inherited || ctx->released)
 			continue;
 
@@ -1111,7 +1119,8 @@ void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
 	prev = NULL;
 	for_each_vma(vmi, vma) {
 		cond_resched();
-		if (vma->vm_userfaultfd_ctx.bpf_ctx != ctx) {
+		if (!bpf_fault_set(vma) ||
+		    vma->vm_userfaultfd_ctx.bpf_ctx != ctx) {
 			prev = vma;
 			continue;
 		}
