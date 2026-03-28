@@ -3,6 +3,9 @@
 /bench_fault_shmem
 /bench_fault_file
 /bench_fault_wp
+/bench_fault_overhead
+/bench_fault_overhead_baseline
+/bench_fault_overhead_bpf
 /test_shmem_fault
 /test_wp_fault
 /test_wp_read_fault

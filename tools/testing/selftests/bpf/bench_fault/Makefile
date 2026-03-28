@@ -23,6 +23,7 @@ USER_LDFLAGS = $(LIBBPF_DIR)/libbpf.a -lelf -lz -lzstd -lpthread
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 
 all: bench_fault bench_fault_scale bench_fault_shmem bench_fault_file \
+	bench_fault_overhead bench_fault_overhead_baseline bench_fault_overhead_bpf \
 	test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
 	test_multi_region test_fork_fault test_wp_read_fault test_file_fault
 
@@ -62,6 +63,36 @@ bench_fault_shmem: bench_fault_shmem.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 bench_fault_file: bench_fault_file.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
+# UFFD overhead breakdown with BPF kprobe instrumentation
+overhead_kprobe.bpf.o: overhead_kprobe.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
+	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+
+overhead_kprobe.skel.h: overhead_kprobe.bpf.o $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+bench_fault_overhead: bench_fault_overhead.c overhead_kprobe.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
+# Baseline overhead breakdown with BPF kprobe instrumentation
+overhead_baseline_kprobe.bpf.o: overhead_baseline_kprobe.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
+	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+
+overhead_baseline_kprobe.skel.h: overhead_baseline_kprobe.bpf.o $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+bench_fault_overhead_baseline: bench_fault_overhead_baseline.c overhead_baseline_kprobe.skel.h $(LIBBPF_DIR)/libbpf.a
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
+
+# bpf_fault overhead breakdown with BPF kprobe instrumentation
+overhead_bpf_kprobe.bpf.o: overhead_bpf_kprobe.bpf.c vmlinux.h $(LIBBPF_DIR)/libbpf.a
+	$(CLANG) $(BPF_CFLAGS) -I$(INCLUDE_DIR) -c $< -o $@
+
+overhead_bpf_kprobe.skel.h: overhead_bpf_kprobe.bpf.o $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+bench_fault_overhead_bpf: bench_fault_overhead_bpf.c overhead_bpf_kprobe.skel.h fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
 test_shmem_fault: test_shmem_fault.c fault_ops.skel.h sigbus_fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
@@ -116,6 +147,7 @@ clean:
 	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault \
 	test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region \
 	test_fork_fault test_wp_read_fault test_file_fault bench_fault_file \
+	bench_fault_overhead bench_fault_overhead_baseline bench_fault_overhead_bpf \
 	*.bpf.o *.skel.h vmlinux.h $(BUILD_DIR)
 
 .PHONY: all clean
