@@ -22,6 +22,7 @@
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,21 @@ static void *worker_thread(void *arg)
 		volatile char *p = (volatile char *)w->base + i * w->page_size;
 		char c = *p;	/* trigger fault */
 		(void)c;
+	}
+
+	return NULL;
+}
+
+static void *baseline_worker_thread(void *arg)
+{
+	struct worker_ctx *w = arg;
+
+	pthread_barrier_wait(w->barrier);
+
+	for (size_t i = 0; i < w->num_pages; i++) {
+		void *p = (char *)w->base + i * w->page_size;
+
+		memset(p, FILL_BYTE, w->page_size);
 	}
 
 	return NULL;
@@ -162,7 +178,7 @@ static int bench_baseline(int num_threads, size_t pages_per_thread)
 			.page_size = page_size,
 			.barrier   = &barrier,
 		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
+		pthread_create(&threads[i], NULL, baseline_worker_thread, &workers[i]);
 	}
 
 	/* Release all workers simultaneously */
@@ -362,16 +378,97 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Benchmark: mprotect + SIGSEGV                                      */
+/* ------------------------------------------------------------------ */
+
+static size_t g_page_size;
+
+static void sigsegv_handler(int sig, siginfo_t *si, void *ctx)
+{
+	unsigned long addr = (unsigned long)si->si_addr;
+	unsigned long page = addr & ~(g_page_size - 1);
+
+	if (mprotect((void *)page, g_page_size, PROT_READ | PROT_WRITE) < 0)
+		_exit(1);
+
+	memset((void *)page, FILL_BYTE, g_page_size);
+}
+
+static int bench_sigsegv(int num_threads, size_t pages_per_thread)
+{
+	size_t page_size = sysconf(_SC_PAGESIZE);
+	size_t total_pages = (size_t)num_threads * pages_per_thread;
+	size_t region_size = total_pages * page_size;
+	pthread_barrier_t barrier;
+	pthread_t *threads;
+	struct worker_ctx *workers;
+	void *region;
+	struct sigaction sa, old_sa;
+	uint64_t t_start, t_end;
+
+	g_page_size = page_size;
+
+	region = mmap(NULL, region_size, PROT_NONE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		return -1;
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = sigsegv_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
+		perror("sigaction");
+		munmap(region, region_size);
+		return -1;
+	}
+
+	pthread_barrier_init(&barrier, NULL, num_threads + 1);
+	threads = calloc(num_threads, sizeof(pthread_t));
+	workers = calloc(num_threads, sizeof(struct worker_ctx));
+
+	for (int i = 0; i < num_threads; i++) {
+		workers[i] = (struct worker_ctx){
+			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
+			.num_pages = pages_per_thread,
+			.page_size = page_size,
+			.barrier   = &barrier,
+		};
+		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
+	}
+
+	t_start = now_ns();
+	pthread_barrier_wait(&barrier);
+
+	for (int i = 0; i < num_threads; i++)
+		pthread_join(threads[i], NULL);
+	t_end = now_ns();
+
+	sigaction(SIGSEGV, &old_sa, NULL);
+
+	printf("mode=sigsegv threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu\n",
+	       num_threads, pages_per_thread, total_pages, t_end - t_start);
+
+	munmap(region, region_size);
+	pthread_barrier_destroy(&barrier);
+	free(threads);
+	free(workers);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-t threads] [-n pages_per_thread] [-b uffd|bpf|baseline|all]\n"
+		"Usage: %s [-t threads] [-n pages_per_thread] [-b uffd|bpf|sigsegv|baseline|all]\n"
 		"  -t  Number of worker threads (default: 1)\n"
 		"  -n  Pages per thread (default: 1024)\n"
-		"  -b  Benchmark mode: uffd, bpf, baseline, or all (default: all)\n",
+		"  -b  Benchmark mode: uffd, bpf, sigsegv, baseline, or all (default: all)\n",
 		prog);
 }
 
@@ -379,7 +476,7 @@ int main(int argc, char **argv)
 {
 	int num_threads = 1;
 	size_t pages_per_thread = 1024;
-	int do_baseline = 1, do_uffd = 1, do_bpf = 1;
+	int do_baseline = 1, do_uffd = 1, do_bpf = 1, do_sigsegv = 1;
 	int opt;
 
 	while ((opt = getopt(argc, argv, "t:n:b:h")) != -1) {
@@ -395,16 +492,24 @@ int main(int argc, char **argv)
 			pages_per_thread = strtoul(optarg, NULL, 0);
 			break;
 		case 'b':
+			do_baseline = 0;
+			do_uffd = 0;
+			do_bpf = 0;
+			do_sigsegv = 0;
 			if (strcmp(optarg, "uffd") == 0) {
-				do_baseline = 0;
-				do_bpf = 0;
+				do_uffd = 1;
 			} else if (strcmp(optarg, "bpf") == 0) {
-				do_baseline = 0;
-				do_uffd = 0;
+				do_bpf = 1;
+			} else if (strcmp(optarg, "sigsegv") == 0) {
+				do_sigsegv = 1;
 			} else if (strcmp(optarg, "baseline") == 0) {
-				do_uffd = 0;
-				do_bpf = 0;
-			} else if (strcmp(optarg, "all") != 0) {
+				do_baseline = 1;
+			} else if (strcmp(optarg, "all") == 0) {
+				do_baseline = 1;
+				do_uffd = 1;
+				do_bpf = 1;
+				do_sigsegv = 1;
+			} else {
 				usage(argv[0]);
 				return 1;
 			}
@@ -420,6 +525,8 @@ int main(int argc, char **argv)
 		bench_baseline(num_threads, pages_per_thread);
 	if (do_uffd)
 		bench_userfaultfd(num_threads, pages_per_thread);
+	if (do_sigsegv)
+		bench_sigsegv(num_threads, pages_per_thread);
 	if (do_bpf)
 		bench_bpf_fault(num_threads, pages_per_thread);
 
