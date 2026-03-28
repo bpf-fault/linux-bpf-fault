@@ -11,15 +11,22 @@
 
 char _license[] SEC("license") = "GPL";
 
+/*
+ * When false, the handler returns immediately without filling the page.
+ * The page stays zeroed (from __GFP_ZERO in folio_alloc).  This is the
+ * "read fault" / ZEROPAGE equivalent for bpf_fault.
+ */
+const volatile __u32 fill_page = 1;
+
 SEC("struct_ops/handle_page_fault")
 int BPF_PROG(handle_page_fault, struct bpf_fault_ops_ctx *ops_ctx,
 	     unsigned char *buf)
 {
-	/* Fill the page with 'A' (0x41) to match the userfaultfd benchmark.
-	 * Use volatile to prevent clang from converting the loop to memset.
-	 */
 	volatile unsigned long *p = (volatile unsigned long *)buf;
 	unsigned long fill = 0x4141414141414141UL;
+
+	if (!fill_page)
+		return 0;
 
 	for (int i = 0; i < 4096 / (int)sizeof(unsigned long); i++)
 		p[i] = fill;
