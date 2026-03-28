@@ -13,6 +13,7 @@
 /test_sigbus_fault
 /test_fork_fault
 /test_multi_region
+/test_uffd_exit
 /*.bpf.o
 /*.skel.h
 /vmlinux.h

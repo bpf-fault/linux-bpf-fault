@@ -25,7 +25,8 @@ VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 all: bench_fault bench_fault_scale bench_fault_shmem bench_fault_file \
 	bench_fault_overhead bench_fault_overhead_baseline bench_fault_overhead_bpf \
 	test_shmem_fault test_wp_fault bench_fault_wp test_sigbus_fault \
-	test_multi_region test_fork_fault test_wp_read_fault test_file_fault
+	test_multi_region test_fork_fault test_wp_read_fault test_file_fault \
+	test_uffd_exit
 
 # Build libbpf from the kernel tree
 $(LIBBPF_DIR)/libbpf.a: $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(LIBBPF_DIR)
@@ -143,10 +144,14 @@ test_fork_fault: test_fork_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 test_file_fault: test_file_fault.c fault_ops.skel.h $(LIBBPF_DIR)/libbpf.a
 	$(HOSTCC) $(USER_CFLAGS) -o $@ $< $(USER_LDFLAGS) -static
 
+# userfaultfd + bpf_fault_exit_mm crash reproducer (no BPF needed)
+test_uffd_exit: test_uffd_exit.c
+	$(HOSTCC) $(USER_CFLAGS) -o $@ $< -static
+
 clean:
 	rm -rf bench_fault bench_fault_scale bench_fault_shmem test_shmem_fault \
 	test_wp_fault bench_fault_wp test_sigbus_fault test_multi_region \
-	test_fork_fault test_wp_read_fault test_file_fault bench_fault_file \
+	test_fork_fault test_wp_read_fault test_file_fault test_uffd_exit bench_fault_file \
 	bench_fault_overhead bench_fault_overhead_baseline bench_fault_overhead_bpf \
 	*.bpf.o *.skel.h vmlinux.h $(BUILD_DIR)
 
