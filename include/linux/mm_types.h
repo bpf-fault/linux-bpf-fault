@@ -719,11 +719,17 @@ struct bpf_fault_ops_ctx {
 	__u32 fault_type;           /* BPF_FAULT_MISSING or BPF_FAULT_WP */
 };
 
+struct bpf_fault_fork_info {
+	__u32 parent_pid;           /* tgid of the forking parent */
+	__u32 child_pid;            /* tgid of the new child */
+};
+
 struct fault_ops {
 	int (*handle_page_fault)(struct bpf_fault_ops_ctx *ctx,
 				 unsigned char *page);
 	int (*handle_wp_fault)(struct bpf_fault_ops_ctx *ctx,
 			       unsigned char *page);
+	void (*handle_fork)(struct bpf_fault_fork_info *ctx);
 };
 
 struct anon_vma_name {

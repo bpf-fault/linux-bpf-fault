@@ -43,6 +43,8 @@ struct bpf_fault_ctx {
 	int inherited;
 	/* parent's bpf_link ID, set during fork for inherited contexts */
 	u32 parent_link_id;
+	/* set during bpf_fault_fork_notify() to deduplicate callbacks */
+	bool fork_notified;
 	/* mm with one or more vmas attached to this bpf_fault_ctx */
 	struct mm_struct *mm;
 	/* bpf link attached to this bpf_fault_ctx */
@@ -92,6 +94,7 @@ void bpf_fault_ops_link_free_inherited(struct bpf_fault_ops_link *link);
 struct bpf_fault_ctx *bpf_fault_find_inherited_ctx(struct mm_struct *mm,
 						   u32 parent_link_id);
 u32 bpf_fault_ops_link_id(struct bpf_fault_ops_link *link);
+void bpf_fault_fork_notify(struct task_struct *child);
 #else
 static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(
 		struct mm_struct *mm, struct bpf_fault_ctx *parent)
@@ -99,6 +102,7 @@ static inline struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(
 	return NULL;
 }
 static inline void bpf_fault_exit_mm(struct mm_struct *mm) {}
+static inline void bpf_fault_fork_notify(struct task_struct *child) {}
 #endif
 
 /*

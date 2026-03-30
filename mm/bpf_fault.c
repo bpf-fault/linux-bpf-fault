@@ -28,6 +28,7 @@
 static struct kmem_cache *bpf_fault_ctx_cachep __ro_after_init;
 
 static const struct btf_type *bpf_fault_ops_ctx_type;
+static const struct btf_type *bpf_fault_fork_info_type;
 
 static pmd_t *bpf_fault_alloc_pmd(struct mm_struct *mm, unsigned long address)
 {
@@ -561,6 +562,7 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc(void)
 	ctx->released = false;
 	ctx->inherited = 0;
 	ctx->parent_link_id = 0;
+	ctx->fork_notified = false;
 	ctx->prog = NULL;
 	ctx->mm = current->mm;
 	mmgrab(ctx->mm);
@@ -594,6 +596,7 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
 	ctx->released = false;
 	ctx->inherited = 1;
 	ctx->parent_link_id = 0;
+	ctx->fork_notified = false;
 	ctx->mm = mm;
 	mmgrab(mm);
 	ctx->prog = child_link;
@@ -986,6 +989,7 @@ static bool bpf_fault_is_valid_access(int off, int size,
 {
 	const char *fname = prog->aux->attach_func_name;
 	bool is_wp = fname && !strcmp(fname, "handle_wp_fault");
+	bool is_fork = fname && !strcmp(fname, "handle_fork");
 
 	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
 		return false;
@@ -993,6 +997,10 @@ static bool bpf_fault_is_valid_access(int off, int size,
 		return false;
 	if (off % size != 0)
 		return false;
+
+	/* handle_fork has no page pointer — only the fork ctx arg */
+	if (is_fork)
+		return btf_ctx_access(off, size, type, prog, info);
 
 	/*
 	 * For handle_page_fault and handle_wp_fault: arg1 is the page
@@ -1027,6 +1035,15 @@ static int bpf_fault_btf_struct_access(struct bpf_verifier_log *log,
 		}
 		return SCALAR_VALUE;
 	}
+	if (t == bpf_fault_fork_info_type) {
+		if (off + size > sizeof(struct bpf_fault_fork_info)) {
+			bpf_log(log,
+				"out of bounds access at off %d with size %d\n",
+				off, size);
+			return -EACCES;
+		}
+		return SCALAR_VALUE;
+	}
 
 	return -EACCES;
 }
@@ -1049,6 +1066,12 @@ static int bpf_fault_ops_init(struct btf *btf)
 	if (type_id < 0)
 		return -EINVAL;
 	bpf_fault_ops_ctx_type = btf_type_by_id(btf, type_id);
+
+	type_id = btf_find_by_name_kind(btf, "bpf_fault_fork_info",
+					BTF_KIND_STRUCT);
+	if (type_id < 0)
+		return -EINVAL;
+	bpf_fault_fork_info_type = btf_type_by_id(btf, type_id);
 
 	return 0;
 }
@@ -1133,6 +1156,60 @@ void bpf_fault_release_all(struct bpf_fault_ctx *ctx)
 	mmput(mm);
 }
 
+/*
+ * Notify BPF fault_ops programs about a fork.
+ *
+ * Called from copy_process() after the child's tgid is assigned but before
+ * the child is visible.  Walks the child's mm looking for inherited
+ * bpf_fault VMAs and calls the struct_ops handle_fork() callback once
+ * per unique bpf_fault_ctx so the BPF program can copy per-PID state
+ * (e.g., arena rbtree entries in pid_tree_map).
+ *
+ * Deduplication uses ctx->fork_notified rather than a dynamically
+ * allocated tracking list so the guarantee holds under memory pressure.
+ * The flag is safe to leave set: each fork creates fresh child contexts
+ * via bpf_fault_ctx_alloc_for_mm() with fork_notified = false.
+ */
+void bpf_fault_fork_notify(struct task_struct *child)
+{
+	struct mm_struct *mm = child->mm;
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	if (!mm)
+		return;
+
+	/*
+	 * No locking needed: the child is not yet visible to other tasks
+	 * and we are the parent holding the only reference.
+	 */
+	for_each_vma(vmi, vma) {
+		struct bpf_fault_ctx *ctx;
+		struct fault_ops *ops;
+		struct bpf_fault_fork_info info;
+
+		if (!(vma->vm_flags & (VM_BPF_FAULT | VM_BPF_FAULT_WP)))
+			continue;
+
+		ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
+		if (!ctx || !ctx->prog)
+			continue;
+
+		if (ctx->fork_notified)
+			continue;
+		ctx->fork_notified = true;
+
+		info.parent_pid = task_tgid_nr(current);
+		info.child_pid = child->tgid;
+
+		rcu_read_lock();
+		ops = bpf_fault_ops_map(ctx->prog);
+		if (ops->handle_fork)
+			ops->handle_fork(&info);
+		rcu_read_unlock();
+	}
+}
+
 static int bpf_fault_reg(void *kdata, struct bpf_link *link)
 {
 	return 0;
@@ -1173,9 +1250,14 @@ static int __bpf_fault_handle_wp_fault(struct bpf_fault_ops_ctx *ctx,
 	return 0;
 }
 
+static void __bpf_fault_handle_fork(struct bpf_fault_fork_info *ctx)
+{
+}
+
 static struct fault_ops __bpf_fault_ops = {
 	.handle_page_fault = __bpf_fault_handle_page_fault,
 	.handle_wp_fault = __bpf_fault_handle_wp_fault,
+	.handle_fork = __bpf_fault_handle_fork,
 };
 
 /*

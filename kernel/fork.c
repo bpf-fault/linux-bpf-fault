@@ -2251,6 +2251,14 @@ __latent_entropy struct task_struct *copy_process(
 		p->tgid = p->pid;
 	}
 
+	/*
+	 * Notify BPF fault_ops about the fork so it can copy per-PID
+	 * state (e.g., rbtree entries).  Must run after tgid is assigned
+	 * and only for process forks (not threads which share the mm).
+	 */
+	if (!(clone_flags & CLONE_VM) && p->mm)
+		bpf_fault_fork_notify(p);
+
 	p->nr_dirtied = 0;
 	p->nr_dirtied_pause = 128 >> (PAGE_SHIFT - 10);
 	p->dirty_paused_when = 0;
