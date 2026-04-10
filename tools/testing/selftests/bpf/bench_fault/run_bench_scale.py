@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 BENCH = os.path.join(SCRIPT_DIR, "bench_fault_scale")
 DEFAULT_THREADS = "1,2,4,8,16,32,64,128,192,256,320,384,448,512"
-DEFAULT_MODES = "baseline,uffd,sigsegv,bpf"
+DEFAULT_MODES = "baseline,uffd,uffd_mt,uffd_mt1,uffd_mfd,sigsegv,bpf"
 
 
 class ScaleBenchmark(BenchmarkFramework):
@@ -81,8 +81,8 @@ class ScaleBenchmark(BenchmarkFramework):
                 for token in line.split():
                     k, v = token.split("=", 1)
                     fields[k] = v
-                for k in ["threads", "pages_per_thread",
-                           "total_faults", "wall_ns"]:
+                for k in ["handlers", "threads", "pages_per_thread",
+                           "total_faults", "wall_ns", "cpu_us"]:
                     if k in fields:
                         fields[k] = int(fields[k])
                 return BenchResults(fields)
