@@ -39,6 +39,8 @@
 #include "fault_ops.skel.h"
 #include "bench_fault_util.h"
 
+static int cdf_mode;
+
 /* ------------------------------------------------------------------ */
 /*  CPU time tracking via getrusage                                    */
 /* ------------------------------------------------------------------ */
@@ -65,13 +67,31 @@ struct worker_ctx {
 	size_t		num_pages;
 	size_t		page_size;
 	pthread_barrier_t *barrier;
+	uint64_t	elapsed_ns;	/* per-thread fault time */
 };
+
+/* ------------------------------------------------------------------ */
+/*  Per-thread CDF output                                              */
+/* ------------------------------------------------------------------ */
+
+static void print_per_thread_times(const char *mode, int num_threads,
+				   struct worker_ctx *workers)
+{
+	if (!cdf_mode)
+		return;
+
+	for (int i = 0; i < num_threads; i++)
+		printf("cdf mode=%s thread=%d elapsed_ns=%lu\n",
+		       mode, i, (unsigned long)workers[i].elapsed_ns);
+}
 
 static void *worker_thread(void *arg)
 {
 	struct worker_ctx *w = arg;
+	uint64_t t0, t1;
 
 	pthread_barrier_wait(w->barrier);
+	t0 = now_ns();
 
 	for (size_t i = 0; i < w->num_pages; i++) {
 		volatile char *p = (volatile char *)w->base + i * w->page_size;
@@ -79,14 +99,18 @@ static void *worker_thread(void *arg)
 		(void)c;
 	}
 
+	t1 = now_ns();
+	w->elapsed_ns = t1 - t0;
 	return NULL;
 }
 
 static void *baseline_worker_thread(void *arg)
 {
 	struct worker_ctx *w = arg;
+	uint64_t t0, t1;
 
 	pthread_barrier_wait(w->barrier);
+	t0 = now_ns();
 
 	for (size_t i = 0; i < w->num_pages; i++) {
 		void *p = (char *)w->base + i * w->page_size;
@@ -94,6 +118,8 @@ static void *baseline_worker_thread(void *arg)
 		memset(p, FILL_BYTE, w->page_size);
 	}
 
+	t1 = now_ns();
+	w->elapsed_ns = t1 - t0;
 	return NULL;
 }
 
@@ -213,6 +239,7 @@ static int bench_baseline(int num_threads, size_t pages_per_thread)
 	printf("mode=baseline threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       num_threads, pages_per_thread, total_pages, t_end - t_start,
 	       cpu_time_us(&ru_before, &ru_after));
+	print_per_thread_times("baseline", num_threads, workers);
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -312,6 +339,7 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 	printf("mode=uffd threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       num_threads, pages_per_thread, total_pages, t_end - t_start,
 	       cpu_time_us(&ru_before, &ru_after));
+	print_per_thread_times("uffd", num_threads, workers);
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -399,6 +427,7 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 	printf("mode=bpf threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       num_threads, pages_per_thread, total_pages, t_end - t_start,
 	       cpu_time_us(&ru_before, &ru_after));
+	print_per_thread_times("bpf", num_threads, workers);
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -484,6 +513,7 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 	printf("mode=sigsegv threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       num_threads, pages_per_thread, total_pages, t_end - t_start,
 	       cpu_time_us(&ru_before, &ru_after));
+	print_per_thread_times("sigsegv", num_threads, workers);
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -499,10 +529,11 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-t threads] [-n pages_per_thread] [-b uffd|bpf|sigsegv|baseline|all]\n"
+		"Usage: %s [-t threads] [-n pages_per_thread] [-b uffd|bpf|sigsegv|baseline|all] [-c]\n"
 		"  -t  Number of worker threads (default: 1)\n"
 		"  -n  Pages per thread (default: 1024)\n"
-		"  -b  Benchmark mode: uffd, bpf, sigsegv, baseline, or all (default: all)\n",
+		"  -b  Benchmark mode: uffd, bpf, sigsegv, baseline, or all (default: all)\n"
+		"  -c  Print per-thread completion times (for CDF plots)\n",
 		prog);
 }
 
@@ -513,7 +544,7 @@ int main(int argc, char **argv)
 	int do_baseline = 1, do_uffd = 1, do_bpf = 1, do_sigsegv = 1;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "t:n:b:h")) != -1) {
+	while ((opt = getopt(argc, argv, "t:n:b:ch")) != -1) {
 		switch (opt) {
 		case 't':
 			num_threads = atoi(optarg);
@@ -524,6 +555,9 @@ int main(int argc, char **argv)
 			break;
 		case 'n':
 			pages_per_thread = strtoul(optarg, NULL, 0);
+			break;
+		case 'c':
+			cdf_mode = 1;
 			break;
 		case 'b':
 			do_baseline = 0;
