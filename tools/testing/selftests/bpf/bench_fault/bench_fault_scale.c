@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,6 +38,23 @@
 
 #include "fault_ops.skel.h"
 #include "bench_fault_util.h"
+
+/* ------------------------------------------------------------------ */
+/*  CPU time tracking via getrusage                                    */
+/* ------------------------------------------------------------------ */
+
+static uint64_t tv_to_us(struct timeval *tv)
+{
+	return (uint64_t)tv->tv_sec * 1000000ULL + tv->tv_usec;
+}
+
+static uint64_t cpu_time_us(struct rusage *before, struct rusage *after)
+{
+	uint64_t user = tv_to_us(&after->ru_utime) - tv_to_us(&before->ru_utime);
+	uint64_t sys  = tv_to_us(&after->ru_stime) - tv_to_us(&before->ru_stime);
+
+	return user + sys;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Worker thread context                                              */
@@ -158,6 +176,7 @@ static int bench_baseline(int num_threads, size_t pages_per_thread)
 	pthread_t *threads;
 	struct worker_ctx *workers;
 	void *region;
+	struct rusage ru_before, ru_after;
 	uint64_t t_start, t_end;
 
 	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
@@ -182,15 +201,18 @@ static int bench_baseline(int num_threads, size_t pages_per_thread)
 	}
 
 	/* Release all workers simultaneously */
+	getrusage(RUSAGE_SELF, &ru_before);
 	t_start = now_ns();
 	pthread_barrier_wait(&barrier);
 
 	for (int i = 0; i < num_threads; i++)
 		pthread_join(threads[i], NULL);
 	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
 
-	printf("mode=baseline threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start);
+	printf("mode=baseline threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
+	       num_threads, pages_per_thread, total_pages, t_end - t_start,
+	       cpu_time_us(&ru_before, &ru_after));
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -217,6 +239,7 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 	struct uffdio_register reg;
 	struct uffd_handler_ctx hctx;
 	pthread_t handler;
+	struct rusage ru_before, ru_after;
 	uint64_t t_start, t_end;
 
 	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
@@ -273,19 +296,22 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
 	}
 
+	getrusage(RUSAGE_SELF, &ru_before);
 	t_start = now_ns();
 	pthread_barrier_wait(&barrier);
 
 	for (int i = 0; i < num_threads; i++)
 		pthread_join(threads[i], NULL);
 	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
 
 	hctx.done = 1;
 	pthread_join(handler, NULL);
 	close(uffd);
 
-	printf("mode=uffd threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start);
+	printf("mode=uffd threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
+	       num_threads, pages_per_thread, total_pages, t_end - t_start,
+	       cpu_time_us(&ru_before, &ru_after));
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -309,6 +335,7 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 	void *region;
 	struct fault_ops_bpf *skel;
 	struct bpf_link *link;
+	struct rusage ru_before, ru_after;
 	uint64_t t_start, t_end;
 
 	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
@@ -357,18 +384,21 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
 	}
 
+	getrusage(RUSAGE_SELF, &ru_before);
 	t_start = now_ns();
 	pthread_barrier_wait(&barrier);
 
 	for (int i = 0; i < num_threads; i++)
 		pthread_join(threads[i], NULL);
 	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
 
 	bpf_link__destroy(link);
 	fault_ops_bpf__destroy(skel);
 
-	printf("mode=bpf threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start);
+	printf("mode=bpf threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
+	       num_threads, pages_per_thread, total_pages, t_end - t_start,
+	       cpu_time_us(&ru_before, &ru_after));
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
@@ -404,6 +434,7 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 	struct worker_ctx *workers;
 	void *region;
 	struct sigaction sa, old_sa;
+	struct rusage ru_before, ru_after;
 	uint64_t t_start, t_end;
 
 	g_page_size = page_size;
@@ -439,17 +470,20 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
 	}
 
+	getrusage(RUSAGE_SELF, &ru_before);
 	t_start = now_ns();
 	pthread_barrier_wait(&barrier);
 
 	for (int i = 0; i < num_threads; i++)
 		pthread_join(threads[i], NULL);
 	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
 
 	sigaction(SIGSEGV, &old_sa, NULL);
 
-	printf("mode=sigsegv threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start);
+	printf("mode=sigsegv threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
+	       num_threads, pages_per_thread, total_pages, t_end - t_start,
+	       cpu_time_us(&ru_before, &ru_after));
 
 	munmap(region, region_size);
 	pthread_barrier_destroy(&barrier);
