@@ -1204,9 +1204,19 @@ void bpf_fault_fork_notify(struct task_struct *child)
 
 		rcu_read_lock();
 		ops = bpf_fault_ops_map(ctx->prog);
-		if (ops->handle_fork)
-			ops->handle_fork(&info);
-		rcu_read_unlock();
+		/* Cache the function pointer; the struct_ops trampoline
+		 * is alive while the link (and thus ctx) is alive.
+		 * Call outside rcu_read_lock so the BPF program can
+		 * invoke sleepable kfuncs (e.g. bpf_arena_alloc_pages).
+		 */
+		if (ops->handle_fork) {
+			void (*fork_fn)(struct bpf_fault_fork_info *) =
+				ops->handle_fork;
+			rcu_read_unlock();
+			fork_fn(&info);
+		} else {
+			rcu_read_unlock();
+		}
 	}
 }
 
