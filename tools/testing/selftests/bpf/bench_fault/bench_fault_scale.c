@@ -460,6 +460,146 @@ static int bench_userfaultfd_mt_impl(int num_threads, size_t pages_per_thread,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Benchmark: userfaultfd with multiple uffd descriptors               */
+/* ------------------------------------------------------------------ */
+
+static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
+				 int num_handlers)
+{
+	size_t page_size = sysconf(_SC_PAGESIZE);
+	size_t total_pages = (size_t)num_threads * pages_per_thread;
+	size_t region_size = total_pages * page_size;
+	pthread_barrier_t barrier;
+	pthread_t *threads;
+	struct worker_ctx *workers;
+	void *region;
+	int *uffds;
+	struct uffd_handler_ctx *hctxs;
+	pthread_t *handlers;
+	struct rusage ru_before, ru_after;
+	uint64_t t_start, t_end;
+	int actual_handlers;
+
+	/*
+	 * Cap handlers at thread count — no point having more handlers
+	 * than workers.
+	 */
+	actual_handlers = num_handlers < num_threads ? num_handlers : num_threads;
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		return -1;
+	}
+
+	uffds = calloc(actual_handlers, sizeof(int));
+	hctxs = calloc(actual_handlers, sizeof(struct uffd_handler_ctx));
+	handlers = calloc(actual_handlers, sizeof(pthread_t));
+
+	/*
+	 * Create one uffd per handler, each covering a disjoint slice
+	 * of the region.  Workers are distributed round-robin across
+	 * slices, so each slice gets ceil(num_threads / actual_handlers)
+	 * workers worth of pages.
+	 */
+	for (int h = 0; h < actual_handlers; h++) {
+		struct uffdio_api api;
+		struct uffdio_register reg;
+		int first_thread, last_thread;
+		size_t slice_start, slice_len;
+
+		first_thread = (int)((long)h * num_threads / actual_handlers);
+		last_thread  = (int)((long)(h + 1) * num_threads / actual_handlers);
+		slice_start  = (size_t)first_thread * pages_per_thread * page_size;
+		slice_len    = (size_t)(last_thread - first_thread) * pages_per_thread * page_size;
+
+		uffds[h] = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+		if (uffds[h] < 0) {
+			perror("userfaultfd");
+			goto fail;
+		}
+
+		api.api = UFFD_API;
+		api.features = 0;
+		if (ioctl(uffds[h], UFFDIO_API, &api) < 0) {
+			perror("UFFDIO_API");
+			goto fail;
+		}
+
+		reg.range.start = (unsigned long)region + slice_start;
+		reg.range.len   = slice_len;
+		reg.mode        = UFFDIO_REGISTER_MODE_MISSING;
+		if (ioctl(uffds[h], UFFDIO_REGISTER, &reg) < 0) {
+			perror("UFFDIO_REGISTER");
+			goto fail;
+		}
+
+		hctxs[h] = (struct uffd_handler_ctx){
+			.uffd      = uffds[h],
+			.page_size = page_size,
+			.done      = 0,
+		};
+		pthread_create(&handlers[h], NULL, uffd_handler_thread, &hctxs[h]);
+	}
+
+	pthread_barrier_init(&barrier, NULL, num_threads + 1);
+	threads = calloc(num_threads, sizeof(pthread_t));
+	workers = calloc(num_threads, sizeof(struct worker_ctx));
+
+	for (int i = 0; i < num_threads; i++) {
+		workers[i] = (struct worker_ctx){
+			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
+			.num_pages = pages_per_thread,
+			.page_size = page_size,
+			.barrier   = &barrier,
+		};
+		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
+	}
+
+	getrusage(RUSAGE_SELF, &ru_before);
+	t_start = now_ns();
+	pthread_barrier_wait(&barrier);
+
+	for (int i = 0; i < num_threads; i++)
+		pthread_join(threads[i], NULL);
+	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
+
+	for (int h = 0; h < actual_handlers; h++) {
+		hctxs[h].done = 1;
+		pthread_join(handlers[h], NULL);
+		close(uffds[h]);
+	}
+
+	printf("mode=uffd_mfd handlers=%d threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
+	       actual_handlers, num_threads, pages_per_thread,
+	       total_pages, t_end - t_start,
+	       cpu_time_us(&ru_before, &ru_after));
+	print_per_thread_times("uffd_mfd", num_threads, workers);
+
+	munmap(region, region_size);
+	pthread_barrier_destroy(&barrier);
+	free(uffds);
+	free(hctxs);
+	free(handlers);
+	free(threads);
+	free(workers);
+	return 0;
+
+fail:
+	for (int h = 0; h < actual_handlers; h++) {
+		if (uffds[h] > 0)
+			close(uffds[h]);
+	}
+	munmap(region, region_size);
+	free(uffds);
+	free(hctxs);
+	free(handlers);
+	return -1;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Benchmark: bpf_fault                                               */
 /* ------------------------------------------------------------------ */
 
@@ -643,9 +783,9 @@ static void usage(const char *prog)
 		"Usage: %s [-t threads] [-n pages_per_thread] [-H handlers] [-b MODE] [-c]\n"
 		"  -t  Number of worker threads (default: 1)\n"
 		"  -n  Pages per thread (default: 1024)\n"
-		"  -H  Number of uffd handlers for uffd_mt (default: 16)\n"
+		"  -H  Number of uffd handlers for uffd_mt/uffd_mfd (default: 16)\n"
 		"  -b  Benchmark mode (default: all):\n"
-		"        uffd, uffd_mt, uffd_mt1, bpf, sigsegv, baseline, all\n"
+		"        uffd, uffd_mt, uffd_mt1, uffd_mfd, bpf, sigsegv, baseline, all\n"
 		"  -c  Print per-thread completion times (for CDF plots)\n",
 		prog);
 }
@@ -655,7 +795,7 @@ int main(int argc, char **argv)
 	int num_threads = 1;
 	size_t pages_per_thread = 1024;
 	int do_baseline = 1, do_uffd = 1, do_uffd_mt = 1, do_uffd_mt1 = 1;
-	int do_bpf = 1, do_sigsegv = 1;
+	int do_uffd_mfd = 1, do_bpf = 1, do_sigsegv = 1;
 	int num_handlers = 16;
 	int opt;
 
@@ -686,6 +826,7 @@ int main(int argc, char **argv)
 			do_uffd = 0;
 			do_uffd_mt = 0;
 			do_uffd_mt1 = 0;
+			do_uffd_mfd = 0;
 			do_bpf = 0;
 			do_sigsegv = 0;
 			if (strcmp(optarg, "uffd") == 0) {
@@ -694,6 +835,8 @@ int main(int argc, char **argv)
 				do_uffd_mt = 1;
 			} else if (strcmp(optarg, "uffd_mt1") == 0) {
 				do_uffd_mt1 = 1;
+			} else if (strcmp(optarg, "uffd_mfd") == 0) {
+				do_uffd_mfd = 1;
 			} else if (strcmp(optarg, "bpf") == 0) {
 				do_bpf = 1;
 			} else if (strcmp(optarg, "sigsegv") == 0) {
@@ -705,6 +848,7 @@ int main(int argc, char **argv)
 				do_uffd = 1;
 				do_uffd_mt = 1;
 				do_uffd_mt1 = 1;
+				do_uffd_mfd = 1;
 				do_bpf = 1;
 				do_sigsegv = 1;
 			} else {
@@ -729,6 +873,9 @@ int main(int argc, char **argv)
 	if (do_uffd_mt1)
 		bench_userfaultfd_mt_impl(num_threads, pages_per_thread,
 					 num_threads, "uffd_mt1");
+	if (do_uffd_mfd)
+		bench_userfaultfd_mfd(num_threads, pages_per_thread,
+				     num_handlers);
 	if (do_sigsegv)
 		bench_sigsegv(num_threads, pages_per_thread);
 	if (do_bpf)
