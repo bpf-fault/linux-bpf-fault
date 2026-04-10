@@ -391,17 +391,31 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 	if (vma->vm_ops && vma->vm_file)
 		mapping = vma->vm_file->f_mapping;
 
+	/*
+	 * Allocate the folio BEFORE releasing the fault lock.  This
+	 * prevents direct reclaim (triggered by folio_alloc) from
+	 * evicting file-backed pages that the BPF program might need
+	 * to read via bpf_probe_read_user().  After fork(), mlock is
+	 * not inherited, so the child's clean file-backed pages (e.g.
+	 * rela tables) are prime reclaim targets.  Allocating while
+	 * the fault lock is held keeps the mm stable.
+	 *
+	 * Use __GFP_NORETRY to avoid excessive reclaim while holding
+	 * the lock.  If allocation fails, release the lock and retry
+	 * with full GFP flags.
+	 */
+	folio = folio_alloc(GFP_HIGHUSER_MOVABLE | __GFP_ZERO |
+			    __GFP_NORETRY, 0);
+
 	release_fault_lock(vmf);
 
-	/*
-	 * Allocate a zeroed folio for the BPF program to populate.
-	 * We use folio_alloc rather than vma_alloc_folio because the
-	 * mmap_lock has been released and the VMA may be gone.
-	 */
-	folio = folio_alloc(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0);
 	if (!folio) {
-		ret = VM_FAULT_RETRY;
-		goto out_put_ctx;
+		/* Retry without NORETRY now that lock is released */
+		folio = folio_alloc(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0);
+		if (!folio) {
+			ret = VM_FAULT_RETRY;
+			goto out_put_ctx;
+		}
 	}
 
 	/* Map the folio into kernel space for the BPF program */
