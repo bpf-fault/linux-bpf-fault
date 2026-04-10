@@ -19,5 +19,7 @@ fi
 for t in $THREADS; do
 	"$BENCH" -t "$t" -n "$PAGES_PER_THREAD" -b baseline
 	"$BENCH" -t "$t" -n "$PAGES_PER_THREAD" -b uffd
+	"$BENCH" -t "$t" -n "$PAGES_PER_THREAD" -b uffd_mt
+	"$BENCH" -t "$t" -n "$PAGES_PER_THREAD" -b uffd_mt1
 	"$BENCH" -t "$t" -n "$PAGES_PER_THREAD" -b bpf
 done
