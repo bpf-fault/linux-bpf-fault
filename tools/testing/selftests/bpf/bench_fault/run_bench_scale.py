@@ -14,6 +14,9 @@
 import logging
 import os
 import sys
+import threading
+
+import psutil
 
 from bench_lib import (
     SCRIPT_DIR,
@@ -33,7 +36,48 @@ DEFAULT_THREADS = "1,2,4,8,16,32,64,128,192,256,320,384,448,512"
 DEFAULT_MODES = "baseline,uffd,uffd_mt,uffd_mt1,uffd_mfd,sigsegv,bpf"
 
 
+class CpuMonitor:
+    """Sample system-wide CPU utilization in a background thread."""
+
+    def __init__(self, interval=0.1):
+        self.interval = interval
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self.samples = []
+        self._stop.clear()
+        psutil.cpu_percent()  # prime the counter
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def _sample(self):
+        while not self._stop.is_set():
+            pct = psutil.cpu_percent(interval=self.interval)
+            self.samples.append(pct)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def stats(self):
+        if not self.samples:
+            return {}
+        return {
+            "cpu_avg": round(sum(self.samples) / len(self.samples), 1),
+            "cpu_peak": round(max(self.samples), 1),
+            "cpu_samples": len(self.samples),
+        }
+
+
 class ScaleBenchmark(BenchmarkFramework):
+
+    def __init__(self, *args, **kwargs):
+        self._cpu_monitor = CpuMonitor()
+        self._cpu_stats = {}
+        super().__init__(*args, **kwargs)
 
     def add_arguments(self, parser):
         # Default --cpu to online CPUs (queried after SMT is disabled)
@@ -68,6 +112,13 @@ class ScaleBenchmark(BenchmarkFramework):
         if not os.path.isfile(BENCH):
             raise FileNotFoundError(f"{BENCH} not found, run 'make' first")
 
+    def before_benchmark(self, config):
+        self._cpu_monitor.start()
+
+    def after_benchmark(self, config):
+        self._cpu_monitor.stop()
+        self._cpu_stats = self._cpu_monitor.stats()
+
     def benchmark_cmd(self, config):
         return ["sudo", BENCH,
                 "-t", str(config["threads"]),
@@ -85,6 +136,8 @@ class ScaleBenchmark(BenchmarkFramework):
                            "total_faults", "wall_ns", "cpu_us"]:
                     if k in fields:
                         fields[k] = int(fields[k])
+                fields.update(self._cpu_stats)
+                self._cpu_stats = {}
                 return BenchResults(fields)
         return BenchResults({})
 
