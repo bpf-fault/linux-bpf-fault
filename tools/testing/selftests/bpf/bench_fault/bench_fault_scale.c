@@ -32,7 +32,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -44,23 +43,6 @@
 #include "bench_fault_util.h"
 
 static int cdf_mode;
-
-/* ------------------------------------------------------------------ */
-/*  CPU time tracking via getrusage                                    */
-/* ------------------------------------------------------------------ */
-
-static uint64_t tv_to_us(struct timeval *tv)
-{
-	return (uint64_t)tv->tv_sec * 1000000ULL + tv->tv_usec;
-}
-
-static uint64_t cpu_time_us(struct rusage *before, struct rusage *after)
-{
-	uint64_t user = tv_to_us(&after->ru_utime) - tv_to_us(&before->ru_utime);
-	uint64_t sys  = tv_to_us(&after->ru_stime) - tv_to_us(&before->ru_stime);
-
-	return user + sys;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Worker thread context                                              */
@@ -125,6 +107,84 @@ static void *baseline_worker_thread(void *arg)
 	t1 = now_ns();
 	w->elapsed_ns = t1 - t0;
 	return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Shared bench helpers                                               */
+/* ------------------------------------------------------------------ */
+
+struct timed_run {
+	uint64_t wall_ns;
+	uint64_t cpu_us;
+};
+
+static int uffd_open_and_register(void *start, size_t len)
+{
+	struct uffdio_api api;
+	struct uffdio_register reg;
+	int uffd;
+
+	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+	if (uffd < 0) {
+		perror("userfaultfd");
+		return -1;
+	}
+
+	api.api = UFFD_API;
+	api.features = 0;
+	if (ioctl(uffd, UFFDIO_API, &api) < 0) {
+		perror("UFFDIO_API");
+		close(uffd);
+		return -1;
+	}
+
+	reg.range.start = (unsigned long)start;
+	reg.range.len   = len;
+	reg.mode        = UFFDIO_REGISTER_MODE_MISSING;
+	if (ioctl(uffd, UFFDIO_REGISTER, &reg) < 0) {
+		perror("UFFDIO_REGISTER");
+		close(uffd);
+		return -1;
+	}
+
+	return uffd;
+}
+
+static void spawn_workers(struct worker_ctx *workers, pthread_t *threads,
+			  int n, void *region, size_t pages_per_thread,
+			  size_t page_size, pthread_barrier_t *barrier,
+			  void *(*fn)(void *))
+{
+	for (int i = 0; i < n; i++) {
+		workers[i] = (struct worker_ctx){
+			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
+			.num_pages = pages_per_thread,
+			.page_size = page_size,
+			.barrier   = barrier,
+		};
+		pthread_create(&threads[i], NULL, fn, &workers[i]);
+	}
+}
+
+static struct timed_run run_timed_workers(pthread_barrier_t *barrier,
+					  pthread_t *threads, int n)
+{
+	struct rusage ru_before, ru_after;
+	uint64_t t_start, t_end;
+
+	getrusage(RUSAGE_SELF, &ru_before);
+	t_start = now_ns();
+	pthread_barrier_wait(barrier);
+
+	for (int i = 0; i < n; i++)
+		pthread_join(threads[i], NULL);
+	t_end = now_ns();
+	getrusage(RUSAGE_SELF, &ru_after);
+
+	return (struct timed_run){
+		.wall_ns = t_end - t_start,
+		.cpu_us  = rusage_cpu_us(&ru_before, &ru_after),
+	};
 }
 
 /* ------------------------------------------------------------------ */
@@ -205,44 +265,24 @@ static int bench_baseline(int num_threads, size_t pages_per_thread)
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct timed_run tr;
 	void *region;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return -1;
-	}
 
 	pthread_barrier_init(&barrier, NULL, num_threads + 1);
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, baseline_worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, baseline_worker_thread);
 
-	/* Release all workers simultaneously */
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	printf("mode=baseline threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       num_threads, pages_per_thread, total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times("baseline", num_threads, workers);
 
 	munmap(region, region_size);
@@ -264,44 +304,18 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct uffd_handler_ctx hctx;
+	struct timed_run tr;
+	pthread_t handler;
 	void *region;
 	int uffd;
-	struct uffdio_api api;
-	struct uffdio_register reg;
-	struct uffd_handler_ctx hctx;
-	pthread_t handler;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return -1;
-	}
 
-	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+	uffd = uffd_open_and_register(region, region_size);
 	if (uffd < 0) {
-		perror("userfaultfd");
-		munmap(region, region_size);
-		return -1;
-	}
-
-	api.api = UFFD_API;
-	api.features = 0;
-	if (ioctl(uffd, UFFDIO_API, &api) < 0) {
-		perror("UFFDIO_API");
-		close(uffd);
-		munmap(region, region_size);
-		return -1;
-	}
-
-	reg.range.start = (unsigned long)region;
-	reg.range.len   = region_size;
-	reg.mode        = UFFDIO_REGISTER_MODE_MISSING;
-	if (ioctl(uffd, UFFDIO_REGISTER, &reg) < 0) {
-		perror("UFFDIO_REGISTER");
-		close(uffd);
 		munmap(region, region_size);
 		return -1;
 	}
@@ -309,7 +323,6 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 	hctx = (struct uffd_handler_ctx){
 		.uffd      = uffd,
 		.page_size = page_size,
-		.done      = 0,
 	};
 	pthread_create(&handler, NULL, uffd_handler_thread, &hctx);
 
@@ -317,32 +330,17 @@ static int bench_userfaultfd(int num_threads, size_t pages_per_thread)
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, worker_thread);
 
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	hctx.done = 1;
 	pthread_join(handler, NULL);
 	close(uffd);
 
 	printf("mode=uffd threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       num_threads, pages_per_thread, total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times("uffd", num_threads, workers);
 
 	munmap(region, region_size);
@@ -365,44 +363,18 @@ static int bench_userfaultfd_mt_impl(int num_threads, size_t pages_per_thread,
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct uffd_handler_ctx hctx;
+	struct timed_run tr;
+	pthread_t *handlers;
 	void *region;
 	int uffd;
-	struct uffdio_api api;
-	struct uffdio_register reg;
-	struct uffd_handler_ctx hctx;
-	pthread_t *handlers;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return -1;
-	}
 
-	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+	uffd = uffd_open_and_register(region, region_size);
 	if (uffd < 0) {
-		perror("userfaultfd");
-		munmap(region, region_size);
-		return -1;
-	}
-
-	api.api = UFFD_API;
-	api.features = 0;
-	if (ioctl(uffd, UFFDIO_API, &api) < 0) {
-		perror("UFFDIO_API");
-		close(uffd);
-		munmap(region, region_size);
-		return -1;
-	}
-
-	reg.range.start = (unsigned long)region;
-	reg.range.len   = region_size;
-	reg.mode        = UFFDIO_REGISTER_MODE_MISSING;
-	if (ioctl(uffd, UFFDIO_REGISTER, &reg) < 0) {
-		perror("UFFDIO_REGISTER");
-		close(uffd);
 		munmap(region, region_size);
 		return -1;
 	}
@@ -410,7 +382,6 @@ static int bench_userfaultfd_mt_impl(int num_threads, size_t pages_per_thread,
 	hctx = (struct uffd_handler_ctx){
 		.uffd      = uffd,
 		.page_size = page_size,
-		.done      = 0,
 	};
 
 	handlers = calloc(num_handlers, sizeof(pthread_t));
@@ -421,24 +392,10 @@ static int bench_userfaultfd_mt_impl(int num_threads, size_t pages_per_thread,
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, worker_thread);
 
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	hctx.done = 1;
 	for (int i = 0; i < num_handlers; i++)
@@ -447,8 +404,7 @@ static int bench_userfaultfd_mt_impl(int num_threads, size_t pages_per_thread,
 
 	printf("mode=%s handlers=%d threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       mode_name, num_handlers, num_threads, pages_per_thread,
-	       total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times(mode_name, num_threads, workers);
 
 	munmap(region, region_size);
@@ -472,13 +428,13 @@ static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct uffd_handler_ctx *hctxs;
+	struct timed_run tr;
+	pthread_t *handlers;
 	void *region;
 	int *uffds;
-	struct uffd_handler_ctx *hctxs;
-	pthread_t *handlers;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 	int actual_handlers;
+	int num_spawned = 0;	/* handlers fully created; bounds fail: cleanup */
 
 	/*
 	 * Cap handlers at thread count — no point having more handlers
@@ -486,26 +442,24 @@ static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
 	 */
 	actual_handlers = num_handlers < num_threads ? num_handlers : num_threads;
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return -1;
-	}
 
 	uffds = calloc(actual_handlers, sizeof(int));
 	hctxs = calloc(actual_handlers, sizeof(struct uffd_handler_ctx));
 	handlers = calloc(actual_handlers, sizeof(pthread_t));
 
+	/* Use -1 as the "not opened" sentinel; fd 0 is a legal uffd. */
+	for (int h = 0; h < actual_handlers; h++)
+		uffds[h] = -1;
+
 	/*
-	 * Create one uffd per handler, each covering a disjoint slice
-	 * of the region.  Workers are distributed round-robin across
-	 * slices, so each slice gets ceil(num_threads / actual_handlers)
-	 * workers worth of pages.
+	 * Create one uffd per handler, each covering a contiguous slice
+	 * of the region.  Workers are assigned to slices in order so each
+	 * handler services ceil(num_threads / actual_handlers) workers.
 	 */
 	for (int h = 0; h < actual_handlers; h++) {
-		struct uffdio_api api;
-		struct uffdio_register reg;
 		int first_thread, last_thread;
 		size_t slice_start, slice_len;
 
@@ -514,57 +468,26 @@ static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
 		slice_start  = (size_t)first_thread * pages_per_thread * page_size;
 		slice_len    = (size_t)(last_thread - first_thread) * pages_per_thread * page_size;
 
-		uffds[h] = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-		if (uffds[h] < 0) {
-			perror("userfaultfd");
+		uffds[h] = uffd_open_and_register((char *)region + slice_start, slice_len);
+		if (uffds[h] < 0)
 			goto fail;
-		}
-
-		api.api = UFFD_API;
-		api.features = 0;
-		if (ioctl(uffds[h], UFFDIO_API, &api) < 0) {
-			perror("UFFDIO_API");
-			goto fail;
-		}
-
-		reg.range.start = (unsigned long)region + slice_start;
-		reg.range.len   = slice_len;
-		reg.mode        = UFFDIO_REGISTER_MODE_MISSING;
-		if (ioctl(uffds[h], UFFDIO_REGISTER, &reg) < 0) {
-			perror("UFFDIO_REGISTER");
-			goto fail;
-		}
 
 		hctxs[h] = (struct uffd_handler_ctx){
 			.uffd      = uffds[h],
 			.page_size = page_size,
-			.done      = 0,
 		};
 		pthread_create(&handlers[h], NULL, uffd_handler_thread, &hctxs[h]);
+		num_spawned++;
 	}
 
 	pthread_barrier_init(&barrier, NULL, num_threads + 1);
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, worker_thread);
 
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	for (int h = 0; h < actual_handlers; h++) {
 		hctxs[h].done = 1;
@@ -574,8 +497,7 @@ static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
 
 	printf("mode=uffd_mfd handlers=%d threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
 	       actual_handlers, num_threads, pages_per_thread,
-	       total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times("uffd_mfd", num_threads, workers);
 
 	munmap(region, region_size);
@@ -588,8 +510,13 @@ static int bench_userfaultfd_mfd(int num_threads, size_t pages_per_thread,
 	return 0;
 
 fail:
+	/* Stop and join any handlers that already started. */
+	for (int h = 0; h < num_spawned; h++)
+		hctxs[h].done = 1;
+	for (int h = 0; h < num_spawned; h++)
+		pthread_join(handlers[h], NULL);
 	for (int h = 0; h < actual_handlers; h++) {
-		if (uffds[h] > 0)
+		if (uffds[h] >= 0)
 			close(uffds[h]);
 	}
 	munmap(region, region_size);
@@ -611,18 +538,14 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct timed_run tr;
 	void *region;
 	struct fault_ops_bpf *skel;
 	struct bpf_link *link;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return -1;
-	}
 
 	skel = fault_ops_bpf__open();
 	if (!skel) {
@@ -653,31 +576,16 @@ static int bench_bpf_fault(int num_threads, size_t pages_per_thread)
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, worker_thread);
 
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	bpf_link__destroy(link);
 	fault_ops_bpf__destroy(skel);
 
 	printf("mode=bpf threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       num_threads, pages_per_thread, total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times("bpf", num_threads, workers);
 
 	munmap(region, region_size);
@@ -712,13 +620,14 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 	pthread_barrier_t barrier;
 	pthread_t *threads;
 	struct worker_ctx *workers;
+	struct timed_run tr;
 	void *region;
 	struct sigaction sa, old_sa;
-	struct rusage ru_before, ru_after;
-	uint64_t t_start, t_end;
 
 	g_page_size = page_size;
 
+	/* PROT_NONE so the first access raises SIGSEGV; the handler
+	 * mprotects the page to PROT_RW.  Can't use alloc_anon_region(). */
 	region = mmap(NULL, region_size, PROT_NONE,
 		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (region == MAP_FAILED) {
@@ -740,30 +649,15 @@ static int bench_sigsegv(int num_threads, size_t pages_per_thread)
 	threads = calloc(num_threads, sizeof(pthread_t));
 	workers = calloc(num_threads, sizeof(struct worker_ctx));
 
-	for (int i = 0; i < num_threads; i++) {
-		workers[i] = (struct worker_ctx){
-			.base      = (char *)region + (size_t)i * pages_per_thread * page_size,
-			.num_pages = pages_per_thread,
-			.page_size = page_size,
-			.barrier   = &barrier,
-		};
-		pthread_create(&threads[i], NULL, worker_thread, &workers[i]);
-	}
+	spawn_workers(workers, threads, num_threads, region, pages_per_thread,
+		      page_size, &barrier, worker_thread);
 
-	getrusage(RUSAGE_SELF, &ru_before);
-	t_start = now_ns();
-	pthread_barrier_wait(&barrier);
-
-	for (int i = 0; i < num_threads; i++)
-		pthread_join(threads[i], NULL);
-	t_end = now_ns();
-	getrusage(RUSAGE_SELF, &ru_after);
+	tr = run_timed_workers(&barrier, threads, num_threads);
 
 	sigaction(SIGSEGV, &old_sa, NULL);
 
 	printf("mode=sigsegv threads=%d pages_per_thread=%zu total_faults=%zu wall_ns=%lu cpu_us=%lu\n",
-	       num_threads, pages_per_thread, total_pages, t_end - t_start,
-	       cpu_time_us(&ru_before, &ru_after));
+	       num_threads, pages_per_thread, total_pages, tr.wall_ns, tr.cpu_us);
 	print_per_thread_times("sigsegv", num_threads, workers);
 
 	munmap(region, region_size);

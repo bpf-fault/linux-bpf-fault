@@ -91,10 +91,8 @@ static void bench_baseline(size_t num_pages, size_t page_size, int write_mode)
 	t_start = now_ns();
 
 	/* Setup phase: just mmap */
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region) {
 		free(fault_latencies);
 		return;
 	}
@@ -260,12 +258,9 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size,
 	t_start = now_ns();
 
 	/* Setup phase */
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		return;
-	}
 
 	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
 	if (uffd < 0) {
@@ -386,12 +381,9 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size,
 	t_start = now_ns();
 
 	/* Setup phase */
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		goto out_unmap;
-	}
 
 	fprintf(stderr, "  [dbg] opening BPF skeleton...\n");
 	fflush(stderr);

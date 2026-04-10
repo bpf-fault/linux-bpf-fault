@@ -39,7 +39,7 @@ DEFAULT_MODES = "baseline,uffd,uffd_mt,uffd_mt1,uffd_mfd,sigsegv,bpf"
 class CpuMonitor:
     """Sample system-wide CPU utilization in a background thread."""
 
-    def __init__(self, interval=0.1):
+    def __init__(self, interval=0.02):
         self.interval = interval
         self.samples = []
         self._stop = threading.Event()
@@ -53,9 +53,12 @@ class CpuMonitor:
         self._thread.start()
 
     def _sample(self):
-        while not self._stop.is_set():
-            pct = psutil.cpu_percent(interval=self.interval)
-            self.samples.append(pct)
+        # Non-blocking sampling (interval=None returns % since last call),
+        # paced by _stop.wait() so stop() wakes us immediately rather than
+        # leaving us stuck inside a blocking cpu_percent() call.  Blocking
+        # at interval=0.1 lost all samples for sub-100ms benchmarks.
+        while not self._stop.wait(timeout=self.interval):
+            self.samples.append(psutil.cpu_percent(interval=None))
 
     def stop(self):
         self._stop.set()

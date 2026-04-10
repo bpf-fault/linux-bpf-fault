@@ -66,7 +66,7 @@ static void bench_bpf_wp(size_t num_pages)
 	size_t region_size = num_pages * page_size;
 	struct wp_fault_ops_bpf *skel = NULL;
 	struct bpf_link *link = NULL;
-	void *region = MAP_FAILED;
+	void *region = NULL;
 	uint64_t t_start, t_setup, t_faults, t_teardown;
 	struct rusage ru_before, ru_after;
 	struct rusage_delta rd;
@@ -80,12 +80,9 @@ static void bench_bpf_wp(size_t num_pages)
 
 	t_start = now_ns();
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		goto out;
-	}
 
 	skel = wp_fault_ops_bpf__open_and_load();
 	if (!skel) {
@@ -146,7 +143,7 @@ out:
 		bpf_link__destroy(link);
 	if (skel)
 		wp_fault_ops_bpf__destroy(skel);
-	if (region != MAP_FAILED)
+	if (region)
 		munmap(region, region_size);
 	free(fault_latencies);
 	fault_latencies = NULL;
@@ -217,7 +214,7 @@ static void *uffd_wp_handler_thread(void *arg)
 static void bench_uffd_wp(size_t num_pages)
 {
 	size_t region_size = num_pages * page_size;
-	void *region = MAP_FAILED;
+	void *region = NULL;
 	int uffd = -1;
 	struct uffdio_api api;
 	struct uffdio_register reg;
@@ -238,12 +235,9 @@ static void bench_uffd_wp(size_t num_pages)
 
 	t_start = now_ns();
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		goto out;
-	}
 
 	uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
 	if (uffd < 0) {
@@ -323,7 +317,7 @@ out:
 	}
 	if (uffd >= 0)
 		close(uffd);
-	if (region != MAP_FAILED)
+	if (region)
 		munmap(region, region_size);
 	free(fault_latencies);
 	fault_latencies = NULL;
@@ -357,7 +351,7 @@ static void sigsegv_handler(int sig, siginfo_t *si, void *ctx)
 static void bench_sigsegv_wp(size_t num_pages)
 {
 	size_t region_size = num_pages * page_size;
-	void *region = MAP_FAILED;
+	void *region = NULL;
 	struct sigaction sa, old_sa;
 	uint64_t t_start, t_setup, t_faults, t_teardown;
 	struct rusage ru_before, ru_after;
@@ -372,12 +366,9 @@ static void bench_sigsegv_wp(size_t num_pages)
 
 	t_start = now_ns();
 
-	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (region == MAP_FAILED) {
-		perror("mmap");
+	region = alloc_anon_region(region_size);
+	if (!region)
 		goto out;
-	}
 
 	populate_pages(region, num_pages);
 
@@ -429,7 +420,7 @@ static void bench_sigsegv_wp(size_t num_pages)
 		      t_faults, t_teardown, &rd, fault_latencies, num_pages, sig_fault_count);
 
 out:
-	if (region != MAP_FAILED)
+	if (region)
 		munmap(region, region_size);
 	free(fault_latencies);
 	fault_latencies = NULL;

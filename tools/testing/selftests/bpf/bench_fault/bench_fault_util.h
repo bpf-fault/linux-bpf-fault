@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -55,6 +56,33 @@ static inline struct rusage_delta rusage_diff(struct rusage *before,
 		.minflt    = after->ru_minflt  - before->ru_minflt,
 		.majflt    = after->ru_majflt  - before->ru_majflt,
 	};
+}
+
+static inline uint64_t rusage_cpu_us(struct rusage *before, struct rusage *after)
+{
+	uint64_t u = (uint64_t)(after->ru_utime.tv_sec  - before->ru_utime.tv_sec) * 1000000ULL
+		   + (uint64_t)(after->ru_utime.tv_usec - before->ru_utime.tv_usec);
+	uint64_t s = (uint64_t)(after->ru_stime.tv_sec  - before->ru_stime.tv_sec) * 1000000ULL
+		   + (uint64_t)(after->ru_stime.tv_usec - before->ru_stime.tv_usec);
+
+	return u + s;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Anonymous region allocation                                        */
+/* ------------------------------------------------------------------ */
+
+static inline void *alloc_anon_region(size_t region_size)
+{
+	void *region;
+
+	region = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (region == MAP_FAILED) {
+		perror("mmap");
+		return NULL;
+	}
+	return region;
 }
 
 /* ------------------------------------------------------------------ */
