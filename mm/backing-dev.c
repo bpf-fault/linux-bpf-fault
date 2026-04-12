@@ -533,6 +533,18 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 	wb->dirty_ratelimit = INIT_BW;
 	wb->write_bandwidth = INIT_BW;
 	wb->avg_write_bandwidth = INIT_BW;
+	/*
+	 * Multi-timescale estimator for the new writeback controller.
+	 * Seeded with INIT_BW so the first few samples do not ratchet from
+	 * zero; bw_confirmed stays false until the first real sample.
+	 * See struct bdi_writeback comments for the timescale breakdown.
+	 */
+	wb->bw_fast = INIT_BW;
+	wb->bw_medium = INIT_BW;
+	wb->bw_slow = INIT_BW;
+	wb->bw_variance = 0;
+	wb->bw_confirmed = false;
+	wb->bw_settled = false;
 
 	spin_lock_init(&wb->work_lock);
 	INIT_LIST_HEAD(&wb->work_list);

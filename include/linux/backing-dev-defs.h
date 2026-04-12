@@ -126,6 +126,39 @@ struct bdi_writeback {
 	unsigned long avg_write_bandwidth; /* further smoothed write bw, > 0 */
 
 	/*
+	 * Multi-timescale bandwidth estimator for the writeback redesign
+	 * (wb branch). Three EWMAs on the same (dirtied - written) delta
+	 * signal, sampled in wb_update_write_bandwidth alongside the legacy
+	 * write_bandwidth. They drive the new PI-based controller's
+	 * effective bandwidth estimate; the legacy fields above continue
+	 * to feed the cubic controller until the PI controller replaces it.
+	 *
+	 *   bw_fast    — ~50 ms half-life (actually ~200 ms during Phase
+	 *                2.1 because update cadence is BANDWIDTH_INTERVAL;
+	 *                drops to 50 ms after the decoupled estimator
+	 *                workfn lands)
+	 *   bw_medium  — ~2 s half-life, tracks sustained throughput
+	 *   bw_slow    — ~30 s half-life, stable historical reference
+	 *
+	 *   bw_variance — running (sample - bw_medium)^2 for CV shrinkage
+	 *   bw_confirmed — set on the first non-quiescent sample so
+	 *                 cold-start logic can tell "never measured" from
+	 *                 "measured zero"
+	 *   bw_settled — set when |bw_fast - bw_medium| < bw_medium/4,
+	 *                gating CV shrinkage so the convergence transient
+	 *                is not interpreted as device noise
+	 *
+	 * All rates are in pages/second like the legacy fields, initialised
+	 * to INIT_BW in wb_init().
+	 */
+	unsigned long bw_fast;
+	unsigned long bw_medium;
+	unsigned long bw_slow;
+	unsigned long bw_variance;
+	bool bw_confirmed;
+	bool bw_settled;
+
+	/*
 	 * The base dirty throttle rate, re-calculated on every 200ms.
 	 * All the bdi tasks' dirty rate will be curbed under it.
 	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit

@@ -1231,6 +1231,116 @@ static void wb_position_ratio(struct dirty_throttle_control *dtc)
 	dtc->pos_ratio = pos_ratio;
 }
 
+/*
+ * Period-weighted EWMA update for the new writeback controller's
+ * multi-timescale estimator. Computes
+ *
+ *           sample_rate * elapsed + old * (period - elapsed)
+ *   new  =  -----------------------------------------------
+ *                                period
+ *
+ * where sample_rate = (pages_delta * HZ) pre-scaled by the caller so
+ * this helper can do integer-only arithmetic. @period must be a power
+ * of two so the division is a shift.
+ *
+ * If elapsed >= period the EWMA fully refreshes to the latest sample.
+ *
+ * The effective time constant is ~period; the effective half-life is
+ * ~0.69 * period. The caller picks @period to target a given half-life.
+ */
+static unsigned long wb_ewma_update(unsigned long old,
+				    u64 sample_rate_scaled,
+				    unsigned long elapsed,
+				    unsigned long period)
+{
+	u64 bw;
+
+	if (unlikely(elapsed >= period))
+		return div64_ul(sample_rate_scaled, elapsed);
+
+	bw = sample_rate_scaled + (u64)old * (period - elapsed);
+	bw >>= ilog2(period);
+	return (unsigned long)bw;
+}
+
+/*
+ * Multi-timescale periods in jiffies. Must all be powers of two so
+ * wb_ewma_update can shift instead of dividing. Target half-lives:
+ *
+ *   WB_BW_FAST_PERIOD    — 50 ms (actual: ~HZ/16 jiffies, half-life
+ *                          ~HZ/23 jiffies, which at HZ=1000 is 43 ms;
+ *                          at HZ=250 is 172 ms). Sampled at the
+ *                          BANDWIDTH_INTERVAL=200 ms cadence in Phase
+ *                          2.1, so effective fast response is still
+ *                          bounded below by the sampling rate — will
+ *                          improve when the estimator moves to its
+ *                          own workfn.
+ *   WB_BW_MEDIUM_PERIOD  — ~2 s (matches the existing 3*HZ period used
+ *                          by write_bandwidth, just named separately
+ *                          for clarity).
+ *   WB_BW_SLOW_PERIOD    — ~30 s stable reference (32 * HZ).
+ */
+#define WB_BW_FAST_PERIOD_TARGET    (HZ / 16 + 1)
+#define WB_BW_MEDIUM_PERIOD_TARGET  (3 * HZ)
+#define WB_BW_SLOW_PERIOD_TARGET    (32 * HZ)
+
+static void wb_update_multi_timescale(struct bdi_writeback *wb,
+				      u64 sample_rate_scaled,
+				      unsigned long elapsed)
+{
+	const unsigned long period_fast =
+		roundup_pow_of_two(WB_BW_FAST_PERIOD_TARGET);
+	const unsigned long period_medium =
+		roundup_pow_of_two(WB_BW_MEDIUM_PERIOD_TARGET);
+	const unsigned long period_slow =
+		roundup_pow_of_two(WB_BW_SLOW_PERIOD_TARGET);
+	unsigned long bw_fast, bw_medium, bw_slow;
+	unsigned long variance;
+	long diff;
+
+	bw_fast = wb_ewma_update(wb->bw_fast, sample_rate_scaled,
+				 elapsed, period_fast);
+	bw_medium = wb_ewma_update(wb->bw_medium, sample_rate_scaled,
+				   elapsed, period_medium);
+	bw_slow = wb_ewma_update(wb->bw_slow, sample_rate_scaled,
+				 elapsed, period_slow);
+
+	/*
+	 * Running variance on (sample - bw_medium)^2, smoothed on the
+	 * medium timescale. This feeds CV shrinkage in the controller
+	 * when bw_settled is true. Using bw_medium rather than bw_slow
+	 * as the baseline keeps the variance signal from being dominated
+	 * by the 30 s slow EWMA's lag during legitimate convergence;
+	 * see wb-plan.md §2.1 and the simulator S10 discussion.
+	 */
+	diff = (long)div64_ul(sample_rate_scaled, max(elapsed, 1UL)) - (long)bw_medium;
+	variance = wb_ewma_update(wb->bw_variance, (u64)(diff * diff) * HZ,
+				  elapsed, period_medium);
+
+	/*
+	 * bw_settled: the three estimators agree within 25% of bw_medium.
+	 * Used as a gate elsewhere in the controller to distinguish
+	 * converged-steady-state from transient-convergence regimes.
+	 * The simulator computes this by comparing bw_fast with bw_medium,
+	 * which matches the kernel's usage of bw_fast as the most
+	 * responsive signal.
+	 */
+	{
+		unsigned long threshold = bw_medium >> 2;
+		unsigned long delta = bw_fast > bw_medium
+				      ? bw_fast - bw_medium
+				      : bw_medium - bw_fast;
+		WRITE_ONCE(wb->bw_settled, delta < threshold);
+	}
+
+	WRITE_ONCE(wb->bw_fast, bw_fast);
+	WRITE_ONCE(wb->bw_medium, bw_medium);
+	WRITE_ONCE(wb->bw_slow, bw_slow);
+	WRITE_ONCE(wb->bw_variance, variance);
+	if (!wb->bw_confirmed && sample_rate_scaled > 0)
+		WRITE_ONCE(wb->bw_confirmed, true);
+}
+
 static void wb_update_write_bandwidth(struct bdi_writeback *wb,
 				      unsigned long elapsed,
 				      unsigned long written)
@@ -1252,6 +1362,15 @@ static void wb_update_write_bandwidth(struct bdi_writeback *wb,
 	 */
 	bw = written - min(written, wb->written_stamp);
 	bw *= HZ;
+
+	/*
+	 * Feed the new multi-timescale estimator from the same sample.
+	 * bw at this point is (pages_delta * HZ); wb_update_multi_timescale
+	 * expects the same pre-scaled value so wb_ewma_update can avoid
+	 * a divide by elapsed on the common path.
+	 */
+	wb_update_multi_timescale(wb, bw, elapsed);
+
 	if (unlikely(elapsed > period)) {
 		bw = div64_ul(bw, elapsed);
 		avg = bw;
