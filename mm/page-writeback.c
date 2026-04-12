@@ -132,6 +132,15 @@ EXPORT_SYMBOL(laptop_mode);
 static unsigned int wb_drain_time_ms = 2000;
 static const unsigned int wb_drain_time_ms_max = 60000; /* 60 s */
 
+/*
+ * Runtime switch between the legacy cubic/step-filter controller and
+ * the new PI + two-constraint-setpoint controller. 0 = legacy, 1 = PI.
+ * Lets hardware benchmarks A/B on the same boot without rebuilding
+ * the kernel. The default is still 0 so this commit is behaviorally
+ * identical to stock until a user explicitly opts in.
+ */
+static unsigned int wb_use_pi;
+
 /* End of sysctl-exported parameters */
 
 struct wb_domain global_wb_domain;
@@ -2370,8 +2379,18 @@ static int balance_dirty_pages(struct bdi_writeback *wb,
 		/*
 		 * If memcg domain is in effect, @dirty should be under
 		 * both global and memcg freerun ceilings.
+		 *
+		 * Under the PI controller (wb_use_pi=1) we never take the
+		 * freerun branch: the new design always runs the control
+		 * loop and always consults pi_dirty_ratelimit for the
+		 * pause. This is the code-level resolution of Issue 1 in
+		 * SESSION.md §"Kernel code analysis" — stock's
+		 * `free_running:` branch was the source of the freerun
+		 * cliff pathology where the entire pos_ratio /
+		 * dirty_ratelimit stack was dead code for most workloads.
 		 */
-		if (gdtc->freerun && (!mdtc || mdtc->freerun)) {
+		if (!READ_ONCE(wb_use_pi) &&
+		    gdtc->freerun && (!mdtc || mdtc->freerun)) {
 			unsigned long intv;
 			unsigned long m_intv;
 
@@ -2395,10 +2414,12 @@ free_running:
 
 		/*
 		 * Calculate global domain's pos_ratio and select the
-		 * global dtc by default.
+		 * global dtc by default. Under wb_use_pi the freerun
+		 * short-circuit below is suppressed too — the PI path
+		 * uses pi_dirty_ratelimit unconditionally.
 		 */
 		balance_wb_limits(gdtc, strictlimit);
-		if (gdtc->freerun)
+		if (!READ_ONCE(wb_use_pi) && gdtc->freerun)
 			goto free_running;
 		sdtc = gdtc;
 
@@ -2410,7 +2431,7 @@ free_running:
 			 * w/ lower pos_ratio.
 			 */
 			balance_wb_limits(mdtc, strictlimit);
-			if (mdtc->freerun)
+			if (!READ_ONCE(wb_use_pi) && mdtc->freerun)
 				goto free_running;
 			if (mdtc->pos_ratio < gdtc->pos_ratio)
 				sdtc = mdtc;
@@ -2422,10 +2443,29 @@ free_running:
 					   BANDWIDTH_INTERVAL))
 			__wb_update_bandwidth(gdtc, mdtc, true);
 
-		/* throttle according to the chosen dtc */
-		dirty_ratelimit = READ_ONCE(wb->dirty_ratelimit);
-		task_ratelimit = ((u64)dirty_ratelimit * sdtc->pos_ratio) >>
-							RATELIMIT_CALC_SHIFT;
+		/*
+		 * Throttle according to the chosen controller.
+		 *
+		 * Legacy (wb_use_pi=0): dirty_ratelimit comes from the
+		 * stock step filter and is modulated by the cubic
+		 * pos_ratio to produce a per-task rate.
+		 *
+		 * PI (wb_use_pi=1): pi_dirty_ratelimit is already the
+		 * task rate — it folds the setpoint error, bandwidth
+		 * tracking, and anti-windup integrator into a single
+		 * output. No pos_ratio multiplication is needed; the
+		 * setpoint shape is encoded in the PI gains, not in a
+		 * separate positional function.
+		 */
+		if (READ_ONCE(wb_use_pi)) {
+			dirty_ratelimit = READ_ONCE(wb->pi_dirty_ratelimit);
+			task_ratelimit = dirty_ratelimit;
+		} else {
+			dirty_ratelimit = READ_ONCE(wb->dirty_ratelimit);
+			task_ratelimit = ((u64)dirty_ratelimit *
+					  sdtc->pos_ratio) >>
+						RATELIMIT_CALC_SHIFT;
+		}
 		max_pause = wb_max_pause(wb, sdtc->wb_dirty);
 		min_pause = wb_min_pause(wb, max_pause,
 					 task_ratelimit, dirty_ratelimit,
@@ -2861,6 +2901,22 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= SYSCTL_ONE,
 		.extra2		= (void *)&wb_drain_time_ms_max,
+	},
+	{
+		/*
+		 * Switch between the legacy cubic/step-filter controller
+		 * (0, default) and the new PI + two-constraint-setpoint
+		 * controller (1). Present for A/B testing during the
+		 * paper's benchmark campaign; eventually the legacy path
+		 * will be deleted and this knob with it.
+		 */
+		.procname	= "wb_use_pi",
+		.data		= &wb_use_pi,
+		.maxlen		= sizeof(wb_use_pi),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 };
 #endif
