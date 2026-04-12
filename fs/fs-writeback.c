@@ -81,12 +81,20 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(wbc_writepage);
 static bool wb_io_lists_populated(struct bdi_writeback *wb)
 {
 	if (wb_has_dirty_io(wb)) {
+		/*
+		 * Refresh the activity timestamp even on non-transition
+		 * calls so a series of populated/depopulated events
+		 * doesn't drop the wb out of the active count between
+		 * bursts that share the same inode.
+		 */
+		wb_ctl_mark_active_locked(wb);
 		return false;
 	} else {
 		set_bit(WB_has_dirty_io, &wb->state);
 		WARN_ON_ONCE(!wb->avg_write_bandwidth);
 		atomic_long_add(wb->avg_write_bandwidth,
 				&wb->bdi->tot_write_bandwidth);
+		wb_ctl_mark_active_locked(wb);
 		return true;
 	}
 }
@@ -98,6 +106,13 @@ static void wb_io_lists_depopulated(struct bdi_writeback *wb)
 		clear_bit(WB_has_dirty_io, &wb->state);
 		WARN_ON_ONCE(atomic_long_sub_return(wb->avg_write_bandwidth,
 					&wb->bdi->tot_write_bandwidth) < 0);
+		/*
+		 * Arm the hysteresis timer: the wb gets decremented from
+		 * the global active-wb count WB_CTL_DEACTIVATE_JIFFIES
+		 * after this call, unless mark_active runs again before
+		 * then.
+		 */
+		wb_ctl_schedule_deactivate_locked(wb);
 	}
 }
 

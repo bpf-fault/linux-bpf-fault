@@ -152,6 +152,25 @@ struct wb_domain {
 	 */
 	unsigned long dirty_limit_tstamp;
 	unsigned long dirty_limit;
+
+	/*
+	 * Count of bdi_writebacks currently considered "active" in this
+	 * domain for the new writeback controller's memory-ceiling
+	 * computation. A wb is active from the moment it first gains
+	 * dirty I/O until 10 s after its last dirty I/O departed (see
+	 * WB_CTL_DEACTIVATE_JIFFIES and wb_ctl_* helpers in
+	 * mm/page-writeback.c). Incremented/decremented lock-free via
+	 * atomic ops with wb->list_lock serializing the transition
+	 * decision in mark/deactivate paths.
+	 *
+	 * The new controller's per-wb memory_ceiling divides the global
+	 * budget (reserved_fraction * dirtyable_memory) by this counter
+	 * to get a fair per-wb share — replacing stock's fprop +
+	 * slack/8 share computation. See wb-plan.md §1.2 and SESSION.md
+	 * §"Simulator regression investigation" for the first-principles
+	 * derivation.
+	 */
+	atomic_t ctl_nr_active_wbs;
 };
 
 /**
@@ -173,6 +192,18 @@ static inline void wb_domain_size_changed(struct wb_domain *dom)
 	dom->dirty_limit = 0;
 	spin_unlock(&dom->lock);
 }
+
+/*
+ * num_active_wbs tracking for the writeback redesign (wb branch).
+ * Called from fs/fs-writeback.c when a wb transitions between
+ * has-dirty-io and no-dirty-io. Both helpers expect the caller to
+ * hold wb->list_lock so the transition is serialized against the
+ * deactivate workfn. See mm/page-writeback.c for the implementation.
+ */
+void wb_ctl_mark_active_locked(struct bdi_writeback *wb);
+void wb_ctl_schedule_deactivate_locked(struct bdi_writeback *wb);
+void wb_ctl_deactivate_work_init(struct bdi_writeback *wb);
+void wb_ctl_shutdown(struct bdi_writeback *wb);
 
 /*
  * fs/fs-writeback.c

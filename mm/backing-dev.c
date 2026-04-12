@@ -546,6 +546,15 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 	wb->bw_confirmed = false;
 	wb->bw_settled = false;
 
+	/*
+	 * num_active_wbs tracking for the new controller. The workfn is
+	 * armed lazily by wb_ctl_schedule_deactivate_locked when the wb
+	 * first goes quiet; nothing else schedules it up front.
+	 */
+	wb->ctl_last_active = jiffies;
+	wb->ctl_in_global = false;
+	wb_ctl_deactivate_work_init(wb);
+
 	spin_lock_init(&wb->work_lock);
 	INIT_LIST_HEAD(&wb->work_list);
 	INIT_DELAYED_WORK(&wb->dwork, wb_workfn);
@@ -587,6 +596,12 @@ static void wb_shutdown(struct bdi_writeback *wb)
 	flush_delayed_work(&wb->dwork);
 	WARN_ON(!list_empty(&wb->work_list));
 	flush_delayed_work(&wb->bw_dwork);
+	/*
+	 * Cancel the controller's deactivate workfn and drop this wb out
+	 * of the global active-wb count if it was still in it. Must run
+	 * before wb_exit frees the workfn storage.
+	 */
+	wb_ctl_shutdown(wb);
 }
 
 static void wb_exit(struct bdi_writeback *wb)

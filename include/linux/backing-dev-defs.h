@@ -159,6 +159,32 @@ struct bdi_writeback {
 	bool bw_settled;
 
 	/*
+	 * num_active_wbs tracking for the new writeback controller.
+	 *
+	 *   ctl_last_active     — jiffies of the most recent "active"
+	 *                         event (wb_io_lists_populated or
+	 *                         explicit wb_ctl_mark_active call).
+	 *   ctl_in_global       — true while this wb is currently counted
+	 *                         in global_wb_domain.ctl_nr_active_wbs.
+	 *                         Transitions are serialized by
+	 *                         wb->list_lock in the mark/deactivate
+	 *                         paths.
+	 *   ctl_deactivate_work — delayed workfn that decrements the
+	 *                         domain counter WB_CTL_DEACTIVATE_JIFFIES
+	 *                         after the wb goes quiet. Hysteresis
+	 *                         prevents churn when bursts are separated
+	 *                         by brief idle gaps.
+	 *
+	 * See wb_ctl_mark_active / wb_ctl_deactivate_workfn in
+	 * mm/page-writeback.c for the transition machinery. memcg domain
+	 * tracking lands in a follow-up commit — for now only the global
+	 * domain is counted.
+	 */
+	unsigned long ctl_last_active;
+	bool ctl_in_global;
+	struct delayed_work ctl_deactivate_work;
+
+	/*
 	 * The base dirty throttle rate, re-calculated on every 200ms.
 	 * All the bdi tasks' dirty rate will be curbed under it.
 	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit

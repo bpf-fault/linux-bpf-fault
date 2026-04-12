@@ -647,6 +647,138 @@ void wb_domain_exit(struct wb_domain *dom)
 #endif
 
 /*
+ * num_active_wbs tracking for the writeback redesign.
+ *
+ * The new controller computes a per-wb memory-ceiling share as
+ *
+ *     ceiling = reserved_fraction * dirtyable_memory / nr_active_wbs
+ *
+ * replacing stock's fprop + slack/8 machinery. "Active" means the wb
+ * has dirty I/O right now, or has had dirty I/O within
+ * WB_CTL_DEACTIVATE_JIFFIES (10 s). The hysteresis prevents the
+ * counter from churning when a wb's bursts are separated by short
+ * idle gaps (matches the active_hold_seconds=10 used by the
+ * simulator's MultiDeviceSimulation; see wb_sim/plant.py).
+ *
+ * Call sites: wb_io_lists_populated (fs/fs-writeback.c) calls
+ * wb_ctl_mark_active_locked when a wb gains its first dirty inode,
+ * and wb_io_lists_depopulated calls wb_ctl_schedule_deactivate_locked
+ * when the last dirty inode leaves. Both call sites hold wb->list_lock,
+ * which serializes the transition decision against the deactivate
+ * workfn (which also takes wb->list_lock before touching the state).
+ *
+ * Only the global domain is counted in this commit; memcg domains
+ * get their own counters in a follow-up commit that wires through
+ * cgwb_domain. The field naming (ctl_in_global) is deliberate so
+ * a ctl_in_memcg follow-up is a straightforward addition.
+ */
+#define WB_CTL_DEACTIVATE_JIFFIES	(10 * HZ)
+
+static void wb_ctl_deactivate_workfn(struct work_struct *work)
+{
+	struct bdi_writeback *wb = container_of(to_delayed_work(work),
+						struct bdi_writeback,
+						ctl_deactivate_work);
+	unsigned long last, elapsed;
+
+	spin_lock(&wb->list_lock);
+	last = wb->ctl_last_active;
+	elapsed = jiffies - last;
+
+	/*
+	 * Re-check after taking the lock: if mark_active updated
+	 * ctl_last_active while this workfn was pending or waiting, just
+	 * reschedule ourselves to the new deadline.
+	 */
+	if (elapsed < WB_CTL_DEACTIVATE_JIFFIES) {
+		spin_unlock(&wb->list_lock);
+		mod_delayed_work(bdi_wq, &wb->ctl_deactivate_work,
+				 WB_CTL_DEACTIVATE_JIFFIES - elapsed);
+		return;
+	}
+
+	if (wb->ctl_in_global) {
+		wb->ctl_in_global = false;
+		atomic_dec(&global_wb_domain.ctl_nr_active_wbs);
+	}
+	spin_unlock(&wb->list_lock);
+}
+
+/**
+ * wb_ctl_mark_active_locked - record that @wb has activity now
+ * @wb: the bdi_writeback that just gained (or still has) dirty I/O
+ *
+ * Called from wb_io_lists_populated (fs/fs-writeback.c) under
+ * wb->list_lock. Updates the activity timestamp and, if this is the
+ * first transition out of the inactive state, bumps the global
+ * domain's active-wb counter.
+ */
+void wb_ctl_mark_active_locked(struct bdi_writeback *wb)
+{
+	assert_spin_locked(&wb->list_lock);
+
+	wb->ctl_last_active = jiffies;
+	if (!wb->ctl_in_global) {
+		wb->ctl_in_global = true;
+		atomic_inc(&global_wb_domain.ctl_nr_active_wbs);
+	}
+}
+EXPORT_SYMBOL_GPL(wb_ctl_mark_active_locked);
+
+/**
+ * wb_ctl_schedule_deactivate_locked - arm the hysteresis timer on @wb
+ * @wb: the bdi_writeback whose last dirty inode just departed
+ *
+ * Called from wb_io_lists_depopulated (fs/fs-writeback.c) under
+ * wb->list_lock. Pushes the deactivate workfn out to
+ * now + WB_CTL_DEACTIVATE_JIFFIES, overwriting any previously
+ * scheduled deadline. The workfn itself re-checks ctl_last_active
+ * before decrementing, so an arrival during the hysteresis window
+ * cleanly cancels the pending decrement.
+ */
+void wb_ctl_schedule_deactivate_locked(struct bdi_writeback *wb)
+{
+	assert_spin_locked(&wb->list_lock);
+
+	wb->ctl_last_active = jiffies;
+	mod_delayed_work(bdi_wq, &wb->ctl_deactivate_work,
+			 WB_CTL_DEACTIVATE_JIFFIES);
+}
+EXPORT_SYMBOL_GPL(wb_ctl_schedule_deactivate_locked);
+
+/**
+ * wb_ctl_deactivate_work_init - initialize a wb's deactivate workfn
+ * @wb: the bdi_writeback to initialize
+ *
+ * Called from wb_init.
+ */
+void wb_ctl_deactivate_work_init(struct bdi_writeback *wb)
+{
+	INIT_DELAYED_WORK(&wb->ctl_deactivate_work, wb_ctl_deactivate_workfn);
+}
+EXPORT_SYMBOL_GPL(wb_ctl_deactivate_work_init);
+
+/**
+ * wb_ctl_shutdown - cancel pending deactivate workfn and decrement
+ * @wb: the bdi_writeback being torn down
+ *
+ * Called from wb_exit (via mm/backing-dev.c) before the wb's memory
+ * is freed. Cancels any pending deactivate workfn synchronously, then
+ * decrements the global counter if this wb was still counted.
+ */
+void wb_ctl_shutdown(struct bdi_writeback *wb)
+{
+	cancel_delayed_work_sync(&wb->ctl_deactivate_work);
+	spin_lock(&wb->list_lock);
+	if (wb->ctl_in_global) {
+		wb->ctl_in_global = false;
+		atomic_dec(&global_wb_domain.ctl_nr_active_wbs);
+	}
+	spin_unlock(&wb->list_lock);
+}
+EXPORT_SYMBOL_GPL(wb_ctl_shutdown);
+
+/*
  * bdi_min_ratio keeps the sum of the minimum dirty shares of all
  * registered backing devices, which, for obvious reasons, can not
  * exceed 100%.
