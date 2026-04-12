@@ -1528,21 +1528,19 @@ static noinline unsigned long
 wb_compute_setpoint_pages(struct bdi_writeback *wb, unsigned long bw_eff,
 			  unsigned long memory_ceiling)
 {
-	unsigned long drain_ms = READ_ONCE(wb_drain_time_ms);
+	unsigned int drain_ms = READ_ONCE(wb_drain_time_ms);
 	unsigned long time_based;
 
 	/*
 	 * time_based = drain_time_ms * bw_eff * 3/4 / 1000
 	 *            = (drain_time_ms * 3 * bw_eff) / 4000
 	 *
-	 * Reorder the multiplications so the intermediate doesn't
-	 * overflow on high-bandwidth devices: for bw_eff up to a few
-	 * GB/s (expressed in pages/second, so ~1.3e6 pages/s per GB/s)
-	 * and drain_ms up to 60000, the product bw_eff * drain_ms is
-	 * on the order of 1e11, which fits in unsigned long on 64-bit.
-	 * On 32-bit the intermediate could overflow, so use u64.
+	 * On a 5 GB/s device bw_eff is ~1.3e6 pages/s and drain_ms up
+	 * to 60000 makes the intermediate ~2.3e11 — needs 64-bit
+	 * arithmetic on 32-bit platforms. drain_ms is clamped to
+	 * 60000 so (drain_ms * 3) fits in u32.
 	 */
-	time_based = (unsigned long)(((u64)drain_ms * 3 * bw_eff) / 4000);
+	time_based = mul_u64_u32_div(bw_eff, drain_ms * 3, 4000);
 	return min(time_based, memory_ceiling);
 }
 
@@ -1550,21 +1548,116 @@ static noinline unsigned long
 wb_compute_freerun_pages(struct bdi_writeback *wb, unsigned long bw_eff,
 			 unsigned long memory_ceiling)
 {
-	unsigned long drain_ms = READ_ONCE(wb_drain_time_ms);
-	unsigned long time_based;
-	unsigned long mem_based;
+	unsigned int drain_ms = READ_ONCE(wb_drain_time_ms);
+	unsigned long time_based, mem_based;
+
+	/* time_based freerun = drain_time_ms * bw_eff / 2000 (= 2/3 of
+	 * the setpoint's time-based term). */
+	time_based = mul_u64_u32_div(bw_eff, drain_ms, 2000);
+	/* When the memory ceiling binds, freerun is 2/3 of it — same
+	 * 0.5/0.75 ratio the simulator's gate model expects. */
+	mem_based = memory_ceiling * 2 / 3;
+	return min(time_based, mem_based);
+}
+
+/*
+ * PI controller for the new task ratelimit computation.
+ *
+ * The classical PI loop is
+ *
+ *     ratelimit = bw_eff + Kp * error + Ki * ∫ error dt
+ *
+ * where error = setpoint - dirty (positive below setpoint, negative
+ * above). At steady state with dirty = setpoint, both the proportional
+ * and integral terms are zero and ratelimit equals bw_eff, matching
+ * the device drain rate. Under a transient (e.g. a bandwidth drop),
+ * the integral drives the task rate away from bw_eff as needed to
+ * push dirty back toward setpoint.
+ *
+ * Gains: Kp = 2 and Ki = 1/(4 * drain_time) in SI units, validated
+ * across ±50% in the simulator's S8 gain sweep as overdamped-stable
+ * on the S1-S16 scenario suite. In the integer kernel implementation
+ * we scale both by power-of-two shifts to avoid division:
+ *
+ *   p_term = 2 * error                                 (Kp = 2)
+ *   Δi     = error * elapsed / (4 * drain_time * HZ)   (Ki integration)
+ *
+ * elapsed is in jiffies so the denominator (4 * drain_time * HZ) is
+ * precomputable from the sysctl; on 64-bit it fits in a u64.
+ *
+ * Anti-windup clamp: |pi_integral| ≤ bw_eff so the integral cannot
+ * push ratelimit below zero or more than 2x above bw_eff. This bounds
+ * overshoot after a step change and matches the simulator's clamp.
+ *
+ * The result is stored in wb->pi_dirty_ratelimit, held alongside the
+ * legacy dirty_ratelimit until a follow-up commit switches the
+ * task-throttling path.
+ */
+static noinline void wb_pi_update(struct bdi_writeback *wb,
+				  unsigned long bw_eff,
+				  unsigned long setpoint,
+				  unsigned long elapsed_jiffies)
+{
+	unsigned long dirty;
+	unsigned int drain_ms;
+	u64 denom;
+	long error;
+	long error_clamped;
+	long p_term;
+	long integral;
+	long integral_max;
+	long out;
 
 	/*
-	 * time_based freerun = drain_time_ms * bw_eff / 2000.
-	 * (= 2/3 of the setpoint's time-based term.)
+	 * Current per-wb dirty pool, read directly from the stat counters
+	 * rather than from a bdp dtc. This decouples the PI update from
+	 * the task-throttling path and lets it run at the
+	 * BANDWIDTH_INTERVAL cadence regardless of whether any task is
+	 * currently in balance_dirty_pages.
+	 *
+	 * WB_RECLAIMABLE counts pages queued for writeback and pages
+	 * marked dirty but not yet queued; WB_WRITEBACK counts pages
+	 * currently under I/O. The sum is the dirty pool a sync() on
+	 * this wb would drain.
 	 */
-	time_based = (unsigned long)(((u64)drain_ms * bw_eff) / 2000);
+	dirty = percpu_counter_read_positive(&wb->stat[WB_RECLAIMABLE]) +
+		percpu_counter_read_positive(&wb->stat[WB_WRITEBACK]);
+
+	error = setpoint - dirty;
+
 	/*
-	 * When the memory ceiling binds, freerun is 2/3 of it — same
-	 * 0.5/0.75 ratio the simulator's gate model expects.
+	 * Integral update:
+	 *   pi_integral += error * elapsed / (4 * drain_time * HZ)
+	 *
+	 * The denominator bundles Ki = 1/(4 * drain_time) with the
+	 * seconds-to-jiffies conversion. drain_ms is milliseconds so
+	 * (4 * drain_time_s * HZ) = (4 * drain_ms * HZ) / 1000.
 	 */
-	mem_based = (memory_ceiling * 2) / 3;
-	return min(time_based, mem_based);
+	drain_ms = READ_ONCE(wb_drain_time_ms);
+	denom = max_t(u64, (u64)drain_ms * HZ * 4 / 1000, 1);
+
+	integral_max = bw_eff;
+	integral = wb->pi_integral +
+		   div_s64((s64)error * elapsed_jiffies, denom);
+	integral = clamp(integral, -integral_max, integral_max);
+
+	/*
+	 * Proportional: Kp = 2 → p_term = error * 2. Clamp error to half
+	 * the signed-long range so the doubling cannot overflow — only
+	 * possible if dirty is billions of pages off setpoint.
+	 */
+	error_clamped = clamp(error, -(LONG_MAX >> 1), LONG_MAX >> 1);
+	p_term = error_clamped * 2;
+
+	/*
+	 * Output: bw_eff + p_term + integral, floored at 1 page/sec so
+	 * the controller never signals "stop entirely" — that path is
+	 * the task's own pause computation, not the ratelimit output.
+	 */
+	out = max_t(long, bw_eff + p_term + integral, 1);
+
+	WRITE_ONCE(wb->pi_integral, integral);
+	WRITE_ONCE(wb->pi_dirty_ratelimit, out);
 }
 
 static void wb_update_multi_timescale(struct bdi_writeback *wb,
@@ -1578,7 +1671,8 @@ static void wb_update_multi_timescale(struct bdi_writeback *wb,
 	const unsigned long period_slow =
 		roundup_pow_of_two(WB_BW_SLOW_PERIOD_TARGET);
 	unsigned long bw_fast, bw_medium, bw_slow;
-	unsigned long variance;
+	unsigned long bw_eff, mem_ceil, setpoint, freerun;
+	unsigned long variance, settled_delta;
 	long diff;
 
 	bw_fast = wb_ewma_update(wb->bw_fast, sample_rate_scaled,
@@ -1596,51 +1690,47 @@ static void wb_update_multi_timescale(struct bdi_writeback *wb,
 	 * by the 30 s slow EWMA's lag during legitimate convergence;
 	 * see wb-plan.md §2.1 and the simulator S10 discussion.
 	 */
-	diff = (long)div64_ul(sample_rate_scaled, max(elapsed, 1UL)) - (long)bw_medium;
+	diff = div64_ul(sample_rate_scaled, max(elapsed, 1UL)) - bw_medium;
 	variance = wb_ewma_update(wb->bw_variance, (u64)(diff * diff) * HZ,
 				  elapsed, period_medium);
 
 	/*
-	 * bw_settled: the three estimators agree within 25% of bw_medium.
-	 * Used as a gate elsewhere in the controller to distinguish
-	 * converged-steady-state from transient-convergence regimes.
-	 * The simulator computes this by comparing bw_fast with bw_medium,
-	 * which matches the kernel's usage of bw_fast as the most
-	 * responsive signal.
+	 * bw_settled: fast and medium estimators agree within 25% of
+	 * bw_medium. Gates CV shrinkage elsewhere in the controller to
+	 * distinguish converged-steady-state from transient convergence.
 	 */
-	{
-		unsigned long threshold = bw_medium >> 2;
-		unsigned long delta = bw_fast > bw_medium
-				      ? bw_fast - bw_medium
-				      : bw_medium - bw_fast;
-		WRITE_ONCE(wb->bw_settled, delta < threshold);
-	}
+	settled_delta = abs_diff(bw_fast, bw_medium);
 
 	WRITE_ONCE(wb->bw_fast, bw_fast);
 	WRITE_ONCE(wb->bw_medium, bw_medium);
 	WRITE_ONCE(wb->bw_slow, bw_slow);
 	WRITE_ONCE(wb->bw_variance, variance);
+	WRITE_ONCE(wb->bw_settled, settled_delta < bw_medium >> 2);
 	if (!wb->bw_confirmed && sample_rate_scaled > 0)
 		WRITE_ONCE(wb->bw_confirmed, true);
 
 	/*
-	 * Refresh the derived two-constraint state so the task-throttling
-	 * path (PI controller, coming in a later commit) can read these
-	 * without recomputing on every throttling decision.
+	 * Refresh the two-constraint state so the PI controller below
+	 * and any debug tooling can read it without recomputing.
 	 */
-	{
-		unsigned long bw_eff, mem_ceil, setpoint, freerun;
+	bw_eff = wb_compute_bw_eff(wb);
+	mem_ceil = wb_compute_memory_ceiling_pages(wb);
+	setpoint = wb_compute_setpoint_pages(wb, bw_eff, mem_ceil);
+	freerun = wb_compute_freerun_pages(wb, bw_eff, mem_ceil);
 
-		bw_eff = wb_compute_bw_eff(wb);
-		mem_ceil = wb_compute_memory_ceiling_pages(wb);
-		setpoint = wb_compute_setpoint_pages(wb, bw_eff, mem_ceil);
-		freerun = wb_compute_freerun_pages(wb, bw_eff, mem_ceil);
+	WRITE_ONCE(wb->ctl_bw_eff, bw_eff);
+	WRITE_ONCE(wb->ctl_memory_ceiling, mem_ceil);
+	WRITE_ONCE(wb->ctl_setpoint, setpoint);
+	WRITE_ONCE(wb->ctl_freerun, freerun);
 
-		WRITE_ONCE(wb->ctl_bw_eff, bw_eff);
-		WRITE_ONCE(wb->ctl_memory_ceiling, mem_ceil);
-		WRITE_ONCE(wb->ctl_setpoint, setpoint);
-		WRITE_ONCE(wb->ctl_freerun, freerun);
-	}
+	/*
+	 * Advance the PI controller. elapsed is the interval since the
+	 * previous __wb_update_bandwidth call — we use it directly as
+	 * the integrator's dt. On the very first sample elapsed can be
+	 * up to one bandwidth period; the anti-windup clamp bounds the
+	 * resulting integral regardless.
+	 */
+	wb_pi_update(wb, bw_eff, setpoint, elapsed);
 }
 
 static void wb_update_write_bandwidth(struct bdi_writeback *wb,

@@ -214,6 +214,30 @@ struct bdi_writeback {
 	unsigned long ctl_freerun;
 
 	/*
+	 * PI controller state for the new task-ratelimit computation.
+	 *
+	 *   pi_integral         — integral accumulator in pages/sec,
+	 *                         clamped to [-bw_eff, +bw_eff] for
+	 *                         anti-windup.
+	 *   pi_dirty_ratelimit  — PI output, the rate at which the
+	 *                         dirtying task should be allowed to
+	 *                         dirty pages (pages/sec). Computed
+	 *                         every BANDWIDTH_INTERVAL in
+	 *                         wb_update_multi_timescale as
+	 *                         max(0, bw_eff + Kp*error + pi_integral).
+	 *                         Held alongside the legacy
+	 *                         dirty_ratelimit until a follow-up commit
+	 *                         switches the task-throttling path to
+	 *                         read pi_dirty_ratelimit instead.
+	 *
+	 * Anti-windup clamp and gains (Kp = 2, Ki = 1/(4 * drain_time))
+	 * are derived from the simulator's S8 gain sweep; see
+	 * wb_pi_update() in mm/page-writeback.c.
+	 */
+	long pi_integral;
+	unsigned long pi_dirty_ratelimit;
+
+	/*
 	 * The base dirty throttle rate, re-calculated on every 200ms.
 	 * All the bdi tasks' dirty rate will be curbed under it.
 	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit

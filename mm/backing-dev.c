@@ -558,13 +558,22 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 	/*
 	 * Two-constraint setpoint cached values. Seeded with INIT_BW
 	 * for bw_eff so pre-first-sample reads don't see zero; the
-	 * setpoint/ceiling seeds are irrelevant because nothing reads
-	 * them until the PI controller lands.
+	 * setpoint/ceiling seeds are irrelevant because the PI
+	 * controller refreshes them before its first read.
 	 */
 	wb->ctl_bw_eff = INIT_BW;
 	wb->ctl_memory_ceiling = 0;
 	wb->ctl_setpoint = 0;
 	wb->ctl_freerun = 0;
+
+	/*
+	 * PI controller state. Seed pi_dirty_ratelimit with INIT_BW
+	 * so the first balance_dirty_pages (once the PI output replaces
+	 * the legacy dirty_ratelimit in a follow-up commit) reads a
+	 * sensible value rather than zero. pi_integral starts at 0.
+	 */
+	wb->pi_integral = 0;
+	wb->pi_dirty_ratelimit = INIT_BW;
 
 	spin_lock_init(&wb->work_lock);
 	INIT_LIST_HEAD(&wb->work_list);
