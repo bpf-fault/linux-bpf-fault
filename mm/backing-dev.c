@@ -555,6 +555,17 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 	wb->ctl_in_global = false;
 	wb_ctl_deactivate_work_init(wb);
 
+	/*
+	 * Two-constraint setpoint cached values. Seeded with INIT_BW
+	 * for bw_eff so pre-first-sample reads don't see zero; the
+	 * setpoint/ceiling seeds are irrelevant because nothing reads
+	 * them until the PI controller lands.
+	 */
+	wb->ctl_bw_eff = INIT_BW;
+	wb->ctl_memory_ceiling = 0;
+	wb->ctl_setpoint = 0;
+	wb->ctl_freerun = 0;
+
 	spin_lock_init(&wb->work_lock);
 	INIT_LIST_HEAD(&wb->work_list);
 	INIT_DELAYED_WORK(&wb->dwork, wb_workfn);

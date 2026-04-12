@@ -185,6 +185,35 @@ struct bdi_writeback {
 	struct delayed_work ctl_deactivate_work;
 
 	/*
+	 * Latest outputs of the two-constraint setpoint helpers, all
+	 * recomputed in wb_update_multi_timescale. Stored on the wb so
+	 * the upcoming PI controller can read them without doing the
+	 * min() computation on every task-throttling decision, and so
+	 * tracepoints / debug tooling can observe them directly.
+	 *
+	 *   ctl_bw_eff            — effective bandwidth estimate
+	 *                           (pages/sec), min(bw_fast, bw_medium)
+	 *                           with CV shrinkage gated on bw_settled.
+	 *   ctl_memory_ceiling    — per-wb fair share of the global
+	 *                           dirty memory budget (pages).
+	 *                           reserved_fraction * dirtyable_memory
+	 *                           / max(nr_active_wbs, 1), floored at
+	 *                           WB_CTL_MIN_BYTES.
+	 *   ctl_setpoint          — the new controller's steady-state
+	 *                           dirty target (pages):
+	 *                           min(drain_time_ms * bw_eff * 3/4000,
+	 *                               ctl_memory_ceiling).
+	 *   ctl_freerun           — the threshold below which bdp's
+	 *                           control loop does not engage
+	 *                           (pages): min(drain_time_ms * bw_eff
+	 *                           / 2000, 2/3 * ctl_memory_ceiling).
+	 */
+	unsigned long ctl_bw_eff;
+	unsigned long ctl_memory_ceiling;
+	unsigned long ctl_setpoint;
+	unsigned long ctl_freerun;
+
+	/*
 	 * The base dirty throttle rate, re-calculated on every 200ms.
 	 * All the bdi tasks' dirty rate will be curbed under it.
 	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit

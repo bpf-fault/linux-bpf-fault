@@ -117,6 +117,21 @@ int laptop_mode;
 
 EXPORT_SYMBOL(laptop_mode);
 
+/*
+ * Target sync-latency budget for the new writeback controller, in
+ * milliseconds. setpoint = drain_time_ms * bw_eff * 3/4 is the
+ * latency-based primary constraint: it bounds the time for a sync()
+ * on currently-dirty pages at the current device bandwidth.
+ *
+ * Unlike vm_dirty_ratio, this knob is *latency-based*, not
+ * RAM-proportional — the user is saying "my worst-case sync() should
+ * finish in N ms" rather than "at most X% of memory may be dirty".
+ * The memory-based safety ceiling (vm_dirty_ratio * dirtyable_memory,
+ * shared fairly across active wbs) still applies as an upper bound.
+ */
+static unsigned int wb_drain_time_ms = 2000;
+static const unsigned int wb_drain_time_ms_max = 60000; /* 60 s */
+
 /* End of sysctl-exported parameters */
 
 struct wb_domain global_wb_domain;
@@ -1416,6 +1431,142 @@ static unsigned long wb_ewma_update(unsigned long old,
 #define WB_BW_MEDIUM_PERIOD_TARGET  (3 * HZ)
 #define WB_BW_SLOW_PERIOD_TARGET    (32 * HZ)
 
+/*
+ * Two-constraint setpoint helpers for the writeback redesign.
+ *
+ * The new controller computes
+ *
+ *     setpoint = min(drain_time_s * bw_eff * 0.75,
+ *                    reserved_fraction * dirtyable_memory / nr_active_wbs)
+ *
+ * which is the minimum of two independent physical constraints:
+ *
+ *   - Latency bound. A sync() on the current dirty pool completes
+ *     within drain_time at the current device bandwidth bw_eff.
+ *     Primary control mechanism, derived from the user-facing
+ *     wb_drain_time_ms sysctl.
+ *
+ *   - Memory bound (safety ceiling). Dirty must not exceed
+ *     reserved_fraction of dirtyable memory, spread fairly across
+ *     currently-active wbs so the total is bounded even with many
+ *     wbs. Reuses vm_dirty_ratio as reserved_fraction, demoting it
+ *     from stock's primary control to a pure safety ceiling.
+ *
+ * See wb-plan.md §1.2 and SESSION.md §"Simulator regression
+ * investigation" for the first-principles derivation and design
+ * alternatives that were rejected (ad-hoc byte caps, contention
+ * multipliers, etc).
+ *
+ * All helpers here are noinline so bpftrace / debug tooling can
+ * observe the intermediate results without needing a dedicated
+ * tracepoint. They are computed every BANDWIDTH_INTERVAL (200 ms)
+ * from wb_update_multi_timescale and the result cached on the wb
+ * so the task-throttling path can read it without recomputing.
+ */
+
+/* 16 MB minimum per-wb memory share to prevent starvation when
+ * num_active_wbs grows unusually large (>100). Normal workloads
+ * never hit this floor.
+ */
+#define WB_CTL_MIN_BYTES (16UL * 1024 * 1024)
+
+static noinline unsigned long wb_compute_bw_eff(struct bdi_writeback *wb)
+{
+	unsigned long fast = READ_ONCE(wb->bw_fast);
+	unsigned long medium = READ_ONCE(wb->bw_medium);
+	unsigned long eff;
+
+	/*
+	 * min() of the two fastest estimators. bw_fast reacts to drops
+	 * within one BANDWIDTH_INTERVAL; bw_medium smooths out sub-
+	 * interval jitter. Taking the minimum biases toward the more
+	 * conservative estimate, which is correct for latency bounding:
+	 * if bandwidth has dropped, we want the setpoint to shrink
+	 * immediately even though the medium EWMA is still catching up.
+	 *
+	 * CV shrinkage (as in the simulator) is deliberately omitted in
+	 * this commit — it depends on bw_settled plus a squared-CV
+	 * integer approximation that adds risk without affecting the
+	 * paper's headline scenarios. Can be added in a follow-up if
+	 * noisy-device scenarios (S10) benefit from it on real hardware.
+	 */
+	eff = min(fast, medium);
+	return max(eff, 1UL);
+}
+
+static noinline unsigned long
+wb_compute_memory_ceiling_pages(struct bdi_writeback *wb)
+{
+	unsigned long dirtyable;
+	unsigned long budget;
+	unsigned long share;
+	unsigned long min_pages;
+	int nr_active;
+
+	/*
+	 * global_dirtyable_memory() returns pages (free + file cache
+	 * minus reserves). This is the total RAM available for writeback
+	 * caching — the budget the ceiling is a fraction of.
+	 *
+	 * memcg-local dirtyable memory is not yet factored in here;
+	 * that lands in a follow-up commit that walks the wb's domains.
+	 * For now all wbs share the global budget.
+	 */
+	dirtyable = global_dirtyable_memory();
+	budget = (dirtyable * vm_dirty_ratio) / 100;
+
+	nr_active = atomic_read(&global_wb_domain.ctl_nr_active_wbs);
+	if (nr_active < 1)
+		nr_active = 1;
+
+	share = budget / nr_active;
+	min_pages = WB_CTL_MIN_BYTES >> PAGE_SHIFT;
+	return max(share, min_pages);
+}
+
+static noinline unsigned long
+wb_compute_setpoint_pages(struct bdi_writeback *wb, unsigned long bw_eff,
+			  unsigned long memory_ceiling)
+{
+	unsigned long drain_ms = READ_ONCE(wb_drain_time_ms);
+	unsigned long time_based;
+
+	/*
+	 * time_based = drain_time_ms * bw_eff * 3/4 / 1000
+	 *            = (drain_time_ms * 3 * bw_eff) / 4000
+	 *
+	 * Reorder the multiplications so the intermediate doesn't
+	 * overflow on high-bandwidth devices: for bw_eff up to a few
+	 * GB/s (expressed in pages/second, so ~1.3e6 pages/s per GB/s)
+	 * and drain_ms up to 60000, the product bw_eff * drain_ms is
+	 * on the order of 1e11, which fits in unsigned long on 64-bit.
+	 * On 32-bit the intermediate could overflow, so use u64.
+	 */
+	time_based = (unsigned long)(((u64)drain_ms * 3 * bw_eff) / 4000);
+	return min(time_based, memory_ceiling);
+}
+
+static noinline unsigned long
+wb_compute_freerun_pages(struct bdi_writeback *wb, unsigned long bw_eff,
+			 unsigned long memory_ceiling)
+{
+	unsigned long drain_ms = READ_ONCE(wb_drain_time_ms);
+	unsigned long time_based;
+	unsigned long mem_based;
+
+	/*
+	 * time_based freerun = drain_time_ms * bw_eff / 2000.
+	 * (= 2/3 of the setpoint's time-based term.)
+	 */
+	time_based = (unsigned long)(((u64)drain_ms * bw_eff) / 2000);
+	/*
+	 * When the memory ceiling binds, freerun is 2/3 of it — same
+	 * 0.5/0.75 ratio the simulator's gate model expects.
+	 */
+	mem_based = (memory_ceiling * 2) / 3;
+	return min(time_based, mem_based);
+}
+
 static void wb_update_multi_timescale(struct bdi_writeback *wb,
 				      u64 sample_rate_scaled,
 				      unsigned long elapsed)
@@ -1471,6 +1622,25 @@ static void wb_update_multi_timescale(struct bdi_writeback *wb,
 	WRITE_ONCE(wb->bw_variance, variance);
 	if (!wb->bw_confirmed && sample_rate_scaled > 0)
 		WRITE_ONCE(wb->bw_confirmed, true);
+
+	/*
+	 * Refresh the derived two-constraint state so the task-throttling
+	 * path (PI controller, coming in a later commit) can read these
+	 * without recomputing on every throttling decision.
+	 */
+	{
+		unsigned long bw_eff, mem_ceil, setpoint, freerun;
+
+		bw_eff = wb_compute_bw_eff(wb);
+		mem_ceil = wb_compute_memory_ceiling_pages(wb);
+		setpoint = wb_compute_setpoint_pages(wb, bw_eff, mem_ceil);
+		freerun = wb_compute_freerun_pages(wb, bw_eff, mem_ceil);
+
+		WRITE_ONCE(wb->ctl_bw_eff, bw_eff);
+		WRITE_ONCE(wb->ctl_memory_ceiling, mem_ceil);
+		WRITE_ONCE(wb->ctl_setpoint, setpoint);
+		WRITE_ONCE(wb->ctl_freerun, freerun);
+	}
 }
 
 static void wb_update_write_bandwidth(struct bdi_writeback *wb,
@@ -2584,6 +2754,23 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
 		.maxlen		= sizeof(laptop_mode),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
+	},
+	{
+		/*
+		 * New writeback controller's latency-based primary
+		 * constraint. Setpoint = drain_time_ms * bw_eff * 3/4.
+		 * Default 2000 ms matches the simulator's
+		 * target_drain_seconds = 2.0. 0 is not accepted; the
+		 * ceiling of 60 s is arbitrary but prevents silly-huge
+		 * values from rendering the ceiling math unstable.
+		 */
+		.procname	= "wb_drain_time_ms",
+		.data		= &wb_drain_time_ms,
+		.maxlen		= sizeof(wb_drain_time_ms),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= (void *)&wb_drain_time_ms_max,
 	},
 };
 #endif
