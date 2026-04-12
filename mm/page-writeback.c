@@ -1423,20 +1423,27 @@ static unsigned long wb_ewma_update(unsigned long old,
  * Multi-timescale periods in jiffies. Must all be powers of two so
  * wb_ewma_update can shift instead of dividing. Target half-lives:
  *
- *   WB_BW_FAST_PERIOD    — 50 ms (actual: ~HZ/16 jiffies, half-life
- *                          ~HZ/23 jiffies, which at HZ=1000 is 43 ms;
- *                          at HZ=250 is 172 ms). Sampled at the
- *                          BANDWIDTH_INTERVAL=200 ms cadence in Phase
- *                          2.1, so effective fast response is still
- *                          bounded below by the sampling rate — will
- *                          improve when the estimator moves to its
- *                          own workfn.
+ *   WB_BW_FAST_PERIOD    — ~700 ms half-life. Must be strictly larger
+ *                          than BANDWIDTH_INTERVAL (HZ/5 = 200 jiffies
+ *                          at HZ=1000), otherwise wb_ewma_update's
+ *                          `elapsed >= period` early-return triggers on
+ *                          every sample and the "fast" EWMA instantly
+ *                          refreshes to the latest raw sample — which
+ *                          means bw_fast collapses to 0 on any zero-
+ *                          sample interval, dragging the PI setpoint
+ *                          down with it. Using HZ+1 (roundup to 1024
+ *                          at HZ=1000) keeps the period above
+ *                          BANDWIDTH_INTERVAL with margin. The
+ *                          decoupled estimator workfn (Phase 2.1
+ *                          follow-up) will sample at a higher rate
+ *                          and can drop this back to a true 50 ms
+ *                          half-life.
  *   WB_BW_MEDIUM_PERIOD  — ~2 s (matches the existing 3*HZ period used
  *                          by write_bandwidth, just named separately
  *                          for clarity).
  *   WB_BW_SLOW_PERIOD    — ~30 s stable reference (32 * HZ).
  */
-#define WB_BW_FAST_PERIOD_TARGET    (HZ / 16 + 1)
+#define WB_BW_FAST_PERIOD_TARGET    (HZ + 1)
 #define WB_BW_MEDIUM_PERIOD_TARGET  (3 * HZ)
 #define WB_BW_SLOW_PERIOD_TARGET    (32 * HZ)
 
@@ -1659,11 +1666,31 @@ static noinline void wb_pi_update(struct bdi_writeback *wb,
 	p_term = error_clamped * 2;
 
 	/*
-	 * Output: bw_eff + p_term + integral, floored at 1 page/sec so
-	 * the controller never signals "stop entirely" — that path is
-	 * the task's own pause computation, not the ratelimit output.
+	 * Output: bw_eff + p_term + integral, floored at bw_eff/4 so
+	 * the controller guarantees forward progress at 1/4 device rate
+	 * even during the worst-case transient where both p_term and
+	 * integral saturate negative.
+	 *
+	 * Without this floor, a large error spike (e.g. dirty suddenly
+	 * above a freshly-shrunk setpoint) drives ratelimit to near-zero
+	 * and the task freezes indefinitely — the bandwidth estimator
+	 * then observes a zero drain rate, shrinks bw_eff further, and
+	 * the system enters a positive-feedback collapse that recovery
+	 * takes seconds-to-minutes to unwind. The floor puts a hard
+	 * bound on how far p_term + integral can push ratelimit below
+	 * bw_eff, breaking the feedback loop.
+	 *
+	 * The floor is bw_eff/4 ≈ 25% device rate; under the floor the
+	 * task still drains dirty at 3/4 device rate, so any overshoot
+	 * above setpoint drains in bounded time:
+	 *
+	 *     max_overshoot_drain_time = (dirty - setpoint) / (3 * bw_eff / 4)
+	 *
+	 * For a device at 100 MB/s and a 400 MB overshoot, that's
+	 * ~5.3 s of throttled draining — much better than the indefinite
+	 * stall of a 1 page/sec floor.
 	 */
-	out = max_t(long, bw_eff + p_term + integral, 1);
+	out = max_t(long, bw_eff + p_term + integral, bw_eff / 4);
 
 	WRITE_ONCE(wb->pi_integral, integral);
 	WRITE_ONCE(wb->pi_dirty_ratelimit, out);
@@ -1683,6 +1710,25 @@ static void wb_update_multi_timescale(struct bdi_writeback *wb,
 	unsigned long bw_eff, mem_ceil, setpoint, freerun;
 	unsigned long variance, settled_delta;
 	long diff;
+
+	/*
+	 * Quiescent hold: when nothing got written in this interval AND
+	 * the wb has no dirty I/O waiting, freeze all EWMAs rather than
+	 * dragging them toward zero with a 0-sample update. Without this
+	 * an idle wb eventually collapses bw_eff to 0, which would drive
+	 * the PI setpoint to 0 and trap the controller the next time a
+	 * burst arrives.
+	 *
+	 * bw_pi_update is still called below so the PI integral and
+	 * output can continue to drain during the hold (if there's
+	 * residual dirty), but the bandwidth estimate stays put.
+	 */
+	if (sample_rate_scaled == 0 && !wb_has_dirty_io(wb)) {
+		bw_eff = READ_ONCE(wb->ctl_bw_eff);
+		setpoint = READ_ONCE(wb->ctl_setpoint);
+		wb_pi_update(wb, bw_eff, setpoint, elapsed);
+		return;
+	}
 
 	bw_fast = wb_ewma_update(wb->bw_fast, sample_rate_scaled,
 				 elapsed, period_fast);
