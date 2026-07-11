@@ -80,6 +80,54 @@ def add_bpf_fault_config_options():
     edit_config_file(config_options)
 
 
+def add_container_virt_config_options():
+    # Docker (moby check-config.sh "Generally Necessary") and Firecracker
+    # dependencies.
+    config_options = {
+        # Container networking: veth pair + docker0 bridge
+        "CONFIG_VETH": "m",
+        "CONFIG_BRIDGE": "m",
+        "CONFIG_BRIDGE_NETFILTER": "m",
+        # Conntrack + NAT core
+        "CONFIG_NF_CONNTRACK": "m",
+        "CONFIG_NF_NAT": "m",
+        "CONFIG_NF_CT_NETLINK": "m",
+        # iptables (legacy tables; Ubuntu's iptables-nft needs NFT_COMPAT)
+        "CONFIG_NETFILTER_XTABLES_LEGACY": "y",
+        "CONFIG_IP_NF_IPTABLES_LEGACY": "m",
+        "CONFIG_IP6_NF_IPTABLES_LEGACY": "m",
+        "CONFIG_IP_NF_IPTABLES": "m",
+        "CONFIG_IP_NF_FILTER": "m",
+        "CONFIG_IP_NF_MANGLE": "m",
+        "CONFIG_IP_NF_NAT": "m",
+        "CONFIG_IP_NF_TARGET_MASQUERADE": "m",
+        "CONFIG_IP6_NF_IPTABLES": "m",
+        "CONFIG_IP6_NF_FILTER": "m",
+        "CONFIG_IP6_NF_MANGLE": "m",
+        "CONFIG_IP6_NF_NAT": "m",
+        "CONFIG_IP6_NF_TARGET_MASQUERADE": "m",
+        # xtables matches/targets docker requires
+        "CONFIG_NETFILTER_XT_MARK": "m",
+        "CONFIG_NETFILTER_XT_NAT": "m",
+        "CONFIG_NETFILTER_XT_TARGET_MASQUERADE": "m",
+        "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE": "m",
+        "CONFIG_NETFILTER_XT_MATCH_CONNTRACK": "m",
+        "CONFIG_NETFILTER_XT_MATCH_IPVS": "m",
+        "CONFIG_IP_VS": "m",
+        # nftables backend for iptables-nft (Ubuntu >= 22.04 default)
+        "CONFIG_NFT_COMPAT": "m",
+        "CONFIG_NFT_NAT": "m",
+        "CONFIG_NFT_MASQ": "m",
+        "CONFIG_NFT_REJECT": "m",
+        # Docker storage driver
+        "CONFIG_OVERLAY_FS": "m",
+        # Firecracker vsock device (integration tests)
+        "CONFIG_VSOCKETS": "m",
+        "CONFIG_VHOST_VSOCK": "m",
+    }
+    edit_config_file(config_options)
+
+
 def add_default_config_options():
     config_options = {
         "CONFIG_RANDOMIZE_BASE": "n",
@@ -122,6 +170,7 @@ def build(args, llvm_env):
     log.info("Building the kernel")
     add_default_config_options()
     add_bpf_fault_config_options()
+    add_container_virt_config_options()
     if args.debug:
         add_debug_config_options()
     make(env=llvm_env)
