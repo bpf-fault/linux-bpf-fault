@@ -506,7 +506,10 @@ class BenchmarkFramework(ABC):
             bench_run = BenchRun(config, bench_run_results)
             results.append(bench_run)
             checkpoint_results(results_file, results)
-            sleep(5)
+            # Brief settle between runs (CPU frequency/thermal state);
+            # measured: deferred teardown from the previous run doesn't
+            # bleed into the next run's wall time even with no sleep.
+            sleep(1)
         all_results = []
         for config in all_configs:
             all_results.append(single_result_select(results, config))
