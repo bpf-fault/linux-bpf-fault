@@ -491,8 +491,11 @@ class BenchmarkFramework(ABC):
                 log.error("Benchmark failed with error code %s" % e.returncode)
                 log.error("Output was: %s" % e.output)
                 raise e
+            finally:
+                # Always stop per-run monitoring, even when the benchmark
+                # fails and the exception propagates.
+                self.after_benchmark(config)
 
-            self.after_benchmark(config)
             log.info("Parsing results...")
             if self.second_command:
                 bench_run_results = self.parse_results(

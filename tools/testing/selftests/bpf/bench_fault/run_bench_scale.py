@@ -142,7 +142,9 @@ class ScaleBenchmark(BenchmarkFramework):
                 fields.update(self._cpu_stats)
                 self._cpu_stats = {}
                 return BenchResults(fields)
-        return BenchResults({})
+        # Don't record an empty result: it would be checkpointed and then
+        # skipped as already-done on every future reuse run.
+        raise ValueError("no 'mode=' result line in benchmark output")
 
 
 if __name__ == "__main__":
