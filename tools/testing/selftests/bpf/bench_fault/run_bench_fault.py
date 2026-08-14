@@ -43,6 +43,10 @@ BENCHMARKS = {
     },
 }
 
+# Fault types whose binary accepts -W to fault with a write instead of a
+# read.  For the others the access mode is fixed at "write".
+WRITE_FLAG_TYPES = ("missing", "minor")
+
 
 class FaultBenchmark(BenchmarkFramework):
 
@@ -88,9 +92,10 @@ class FaultBenchmark(BenchmarkFramework):
                 for mode in BENCHMARKS[ft]["modes"]:
                     if mode_filter and mode not in mode_filter:
                         continue
-                    # Access modes only apply to missing faults
-                    # (bench_fault supports -W; wp/shmem binaries don't)
-                    ft_access = access_modes if ft == "missing" else ["write"]
+                    # bench_fault and bench_fault_shmem take -W; the wp
+                    # binary always writes (that is what lifts the WP).
+                    ft_access = (access_modes if ft in WRITE_FLAG_TYPES
+                                 else ["write"])
                     for access in ft_access:
                         c = config.copy()
                         c["fault_type"] = ft
@@ -117,7 +122,7 @@ class FaultBenchmark(BenchmarkFramework):
                "-n", str(config["num_pages"]),
                "-r", "1",
                "-b", config["mode"]]
-        if config.get("access") == "write" and ft == "missing":
+        if config.get("access") == "write" and ft in WRITE_FLAG_TYPES:
             cmd.append("-W")
         return cmd
 

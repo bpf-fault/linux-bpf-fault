@@ -13,10 +13,20 @@
  *               from the page cache, lets the BPF program modify it, and
  *               installs a private COW copy (MAP_PRIVATE)
  *
+ * Faults are triggered by a read touch by default, or by a full-page
+ * write with -W.  Write mode matters for the baseline: a read on a
+ * MAP_PRIVATE shmem mapping maps the page cache folio read-only and is
+ * eligible for fault-around (one fault maps up to 16 pages), whereas a
+ * write takes do_cow_fault() per page and copies the folio into a fresh
+ * anon page -- the same work bpf_fault does when it installs a private
+ * copy.  Only the write numbers are comparable across the three modes.
+ *
  * The file is written with 'X' (0x58).  The BPF program overwrites each
- * page with 'A' (0x41).  Verification checks:
- *   baseline: pages contain 'X' (original file data)
- *   uffd:     pages contain 'X' (UFFDIO_CONTINUE maps existing page)
+ * page with 'A' (0x41), and write mode fills each page with 'A' too.
+ * Verification checks:
+ *   baseline: pages contain 'X' (original file data), 'A' in write mode
+ *   uffd:     pages contain 'X' (UFFDIO_CONTINUE maps existing page),
+ *             'A' in write mode
  *   bpf:      pages contain 'A' (BPF program output)
  *
  * Note: uffd uses MAP_SHARED (required for UFFD_REGISTER_MODE_MINOR on
@@ -53,6 +63,17 @@
 static uint64_t *fault_latencies;
 
 #define FILE_BYTE   'X'   /* file pre-populated with this */
+
+static inline void trigger_fault(volatile char *p, int write_mode,
+				 size_t page_size)
+{
+	if (write_mode)
+		memset((void *)p, FILL_BYTE, page_size);
+	else {
+		char c = *p;
+		(void)c;
+	}
+}
 
 /* ------------------------------------------------------------------ */
 /*  tmpfs file helpers                                                  */
@@ -101,7 +122,7 @@ static int create_tmpfs_file(size_t num_pages, size_t page_size)
 /*  baseline benchmark: MAP_PRIVATE shmem, no interception              */
 /* ------------------------------------------------------------------ */
 
-static void bench_baseline(size_t num_pages, size_t page_size)
+static void bench_baseline(size_t num_pages, size_t page_size, int write_mode)
 {
 	size_t region_size = num_pages * page_size;
 	void *region;
@@ -110,7 +131,8 @@ static void bench_baseline(size_t num_pages, size_t page_size)
 	struct rusage ru_before, ru_after;
 	struct rusage_delta rd;
 
-	printf("=== shmem baseline benchmark (no bpf) ===\n");
+	printf("=== shmem baseline benchmark (no bpf, %s faults) ===\n",
+	       write_mode ? "write" : "read");
 	printf("  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
 	       num_pages, page_size, region_size);
 
@@ -141,29 +163,33 @@ static void bench_baseline(size_t num_pages, size_t page_size)
 	for (size_t i = 0; i < num_pages; i++) {
 		volatile char *p = (volatile char *)region + i * page_size;
 		uint64_t before = now_ns();
-		char c = *p;  /* trigger the fault */
+
+		trigger_fault(p, write_mode, page_size);
 		uint64_t after = now_ns();
 
 		fault_latencies[i] = after - before;
-		(void)c;
 	}
 
 	ru_after = rusage_snap();
 	t_faults = now_ns();
 	t_end = t_faults;
 
-	/* Verify: should see original file data */
+	/*
+	 * Verify: read mode maps the page cache folio, so pages hold the
+	 * original file data; write mode COWs and fills with FILL_BYTE.
+	 */
+	unsigned char expect = write_mode ? FILL_BYTE : FILE_BYTE;
 	int errors = 0;
 
 	for (size_t i = 0; i < num_pages; i++) {
 		unsigned char *p = (unsigned char *)region + i * page_size;
 
-		if (p[0] != FILE_BYTE) {
+		if (p[0] != expect) {
 			errors++;
 			if (errors <= 3)
 				fprintf(stderr,
 					"  page %zu: got 0x%02x expected 0x%02x\n",
-					i, p[0], FILE_BYTE);
+					i, p[0], expect);
 		}
 	}
 	if (errors)
@@ -245,7 +271,8 @@ static void *uffd_handler_thread(void *arg)
 	return NULL;
 }
 
-static void bench_userfaultfd(size_t num_pages, size_t page_size)
+static void bench_userfaultfd(size_t num_pages, size_t page_size,
+			      int write_mode)
 {
 	size_t region_size = num_pages * page_size;
 	void *region;
@@ -258,7 +285,8 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size)
 	struct rusage ru_before, ru_after;
 	struct rusage_delta rd;
 
-	printf("=== shmem userfaultfd benchmark (MINOR mode) ===\n");
+	printf("=== shmem userfaultfd benchmark (MINOR mode, %s faults) ===\n",
+	       write_mode ? "write" : "read");
 	printf("  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
 	       num_pages, page_size, region_size);
 
@@ -323,11 +351,12 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size)
 	for (size_t i = 0; i < num_pages; i++) {
 		volatile char *p = (volatile char *)region + i * page_size;
 		uint64_t before = now_ns();
-		char c = *p;  /* trigger the minor fault */
+
+		/* trigger the minor fault */
+		trigger_fault(p, write_mode, page_size);
 		uint64_t after = now_ns();
 
 		fault_latencies[i] = after - before;
-		(void)c;
 	}
 
 	ru_after = rusage_snap();
@@ -341,18 +370,22 @@ static void bench_userfaultfd(size_t num_pages, size_t page_size)
 	t_teardown = now_ns();
 	t_end = t_teardown;
 
-	/* Verify: UFFDIO_CONTINUE maps existing page, should see FILE_BYTE */
+	/*
+	 * Verify: UFFDIO_CONTINUE maps the existing page, so reads see
+	 * FILE_BYTE; write mode overwrites the shared page with FILL_BYTE.
+	 */
+	unsigned char expect = write_mode ? FILL_BYTE : FILE_BYTE;
 	int errors = 0;
 
 	for (size_t i = 0; i < num_pages; i++) {
 		unsigned char *p = (unsigned char *)region + i * page_size;
 
-		if (p[0] != FILE_BYTE) {
+		if (p[0] != expect) {
 			errors++;
 			if (errors <= 3)
 				fprintf(stderr,
 					"  page %zu: got 0x%02x expected 0x%02x\n",
-					i, p[0], FILE_BYTE);
+					i, p[0], expect);
 		}
 	}
 	if (errors)
@@ -382,7 +415,7 @@ out_unmap_uffd:
 /*  bpf_fault benchmark: MAP_PRIVATE shmem with bpf_fault               */
 /* ------------------------------------------------------------------ */
 
-static void bench_bpf_fault(size_t num_pages, size_t page_size)
+static void bench_bpf_fault(size_t num_pages, size_t page_size, int write_mode)
 {
 	size_t region_size = num_pages * page_size;
 	void *region;
@@ -393,7 +426,8 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 	struct rusage ru_before, ru_after;
 	struct rusage_delta rd;
 
-	printf("=== shmem bpf_fault benchmark ===\n");
+	printf("=== shmem bpf_fault benchmark (%s faults) ===\n",
+	       write_mode ? "write" : "read");
 	printf("  Pages: %zu  Page size: %zu  Region: %zu bytes\n",
 	       num_pages, page_size, region_size);
 	fflush(stdout);
@@ -445,11 +479,11 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 	for (size_t i = 0; i < num_pages; i++) {
 		volatile char *p = (volatile char *)region + i * page_size;
 		uint64_t before = now_ns();
-		char c = *p;  /* trigger the fault */
+
+		trigger_fault(p, write_mode, page_size);
 		uint64_t after = now_ns();
 
 		fault_latencies[i] = after - before;
-		(void)c;
 	}
 
 	ru_after = rusage_snap();
@@ -463,7 +497,11 @@ static void bench_bpf_fault(size_t num_pages, size_t page_size)
 	t_teardown = now_ns();
 	t_end = t_teardown;
 
-	/* Verify: BPF program should have filled with FILL_BYTE */
+	/*
+	 * Verify: BPF program should have filled with FILL_BYTE.  In write
+	 * mode the fault loop fills with the same byte, so this only
+	 * confirms the private copy is intact, not that BPF produced it.
+	 */
 	int errors = 0;
 
 	for (size_t i = 0; i < num_pages; i++) {
@@ -507,11 +545,12 @@ out_unmap:
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [-n num_pages] [-r rounds] [-b baseline|uffd|bpf|all]\n",
+		"Usage: %s [-n num_pages] [-r rounds] [-b baseline|uffd|bpf|all] [-W]\n",
 		prog);
 	fprintf(stderr, "  -n  Number of pages to fault (default: 1024)\n");
 	fprintf(stderr, "  -r  Number of rounds (default: 3)\n");
 	fprintf(stderr, "  -b  Which benchmark: baseline, uffd, bpf, or all (default: all)\n");
+	fprintf(stderr, "  -W  Trigger faults with a write instead of a read\n");
 }
 
 int main(int argc, char **argv)
@@ -519,16 +558,20 @@ int main(int argc, char **argv)
 	size_t num_pages = 1024;
 	int rounds = 3;
 	int do_baseline = 1, do_uffd = 1, do_bpf = 1;
+	int write_mode = 0;
 	long page_size = sysconf(_SC_PAGESIZE);
 	int opt;
 
-	while ((opt = getopt(argc, argv, "n:r:b:h")) != -1) {
+	while ((opt = getopt(argc, argv, "n:r:b:Wh")) != -1) {
 		switch (opt) {
 		case 'n':
 			num_pages = strtoul(optarg, NULL, 0);
 			break;
 		case 'r':
 			rounds = atoi(optarg);
+			break;
+		case 'W':
+			write_mode = 1;
 			break;
 		case 'b':
 			if (strcmp(optarg, "uffd") == 0) {
@@ -552,18 +595,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	printf("Shmem page fault benchmark: %zu pages (%zu bytes), %d rounds\n\n",
-	       num_pages, num_pages * page_size, rounds);
+	printf("Shmem page fault benchmark: %zu pages (%zu bytes), %d rounds, %s faults\n\n",
+	       num_pages, num_pages * page_size, rounds,
+	       write_mode ? "write" : "read");
 
 	for (int r = 0; r < rounds; r++) {
 		printf("--- Round %d/%d ---\n\n", r + 1, rounds);
 
 		if (do_baseline)
-			bench_baseline(num_pages, page_size);
+			bench_baseline(num_pages, page_size, write_mode);
 		if (do_uffd)
-			bench_userfaultfd(num_pages, page_size);
+			bench_userfaultfd(num_pages, page_size, write_mode);
 		if (do_bpf)
-			bench_bpf_fault(num_pages, page_size);
+			bench_bpf_fault(num_pages, page_size, write_mode);
 	}
 
 	return 0;
