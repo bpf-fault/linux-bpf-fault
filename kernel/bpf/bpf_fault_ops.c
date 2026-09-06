@@ -32,6 +32,8 @@ struct fault_ops *bpf_fault_ops_map(struct bpf_fault_ops_link *link)
 	struct bpf_struct_ops_map *st_map;
 
 	st_map = (struct bpf_struct_ops_map *)rcu_dereference(link->map);
+	if (!st_map)
+		return NULL;
 	return (struct fault_ops *)st_map->kvalue.data;
 }
 
@@ -41,6 +43,16 @@ static void bpf_fault_ops_link_dealloc(struct bpf_link *link)
 	struct bpf_struct_ops_map *st_map;
 
 	st_link = container_of(link, struct bpf_fault_ops_link, link);
+
+	/*
+	 * Unregister the VMAs first.  bpf_fault_release_all() sets
+	 * ctx->released and clears VM_BPF_FAULT under mmap_write_lock, so
+	 * once it returns no new fault can reach the handler.  Doing it
+	 * after unreg() left a window in which a fault could still call
+	 * into an already-unregistered struct_ops.
+	 */
+	bpf_fault_release_all(st_link->ctx);
+
 	st_map = (struct bpf_struct_ops_map *)
 		rcu_dereference_protected(st_link->map, true);
 	if (st_map) {
@@ -53,7 +65,6 @@ static void bpf_fault_ops_link_dealloc(struct bpf_link *link)
 		bpf_map_put(&st_map->map);
 	}
 
-	bpf_fault_release_all(st_link->ctx);
 	bpf_fault_ctx_put(st_link->ctx);
 	kfree(st_link);
 }
@@ -200,7 +211,12 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 						&link->link);
 	if (err) {
 		mutex_unlock(&fault_update_mutex);
-		bpf_fault_ctx_free(link->ctx);
+		/*
+		 * Do not free link->ctx here: bpf_link_cleanup() drops the
+		 * last file reference, which runs the dealloc callback and
+		 * releases the ctx.  Freeing it first left a dangling
+		 * link->ctx for dealloc to release a second time.
+		 */
 		bpf_link_cleanup(&link_primer);
 		link = NULL;
 		goto err_out;
@@ -209,20 +225,28 @@ int bpf_fault_ops_link_create(union bpf_attr *attr)
 
 	link->ctx->prog = link;
 
+	/*
+	 * Publish the map before registering any VMA.  Registration makes
+	 * the range faultable, and a concurrent fault resolves the handler
+	 * through bpf_fault_ops_map(link->map); if the map were still NULL
+	 * the fault would dereference it.
+	 */
+	RCU_INIT_POINTER(link->map, map);
+
 	err = bpf_fault_register(link->ctx,
 				 attr->link_create.fault.start,
 				 attr->link_create.fault.len,
 				 attr->link_create.fault.flags);
 	if (err) {
-		/* Undo reg() — dealloc won't call unreg since map isn't set. */
-		st_map->st_ops_desc->st_ops->unreg(st_map->kvalue.data,
-						    &link->link);
+		/*
+		 * The map is published, so dealloc now owns both the unreg()
+		 * and the map reference taken above.  Return directly rather
+		 * than falling through to err_out's bpf_map_put().
+		 */
 		bpf_link_cleanup(&link_primer);
-		link = NULL;
-		goto err_out;
+		return err;
 	}
 
-	RCU_INIT_POINTER(link->map, map);
 	return bpf_link_settle(&link_primer);
 
 err_out:
@@ -372,11 +396,12 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 		err = -ENOENT;
 		goto out_put_parent;
 	}
+	/* ctx now carries a reference; drop it on every path below. */
 
 	/* Atomically claim — only one thread wins the race */
 	if (!xchg(&ctx->inherited, 0)) {
 		err = -EBUSY;
-		goto out_put_parent;
+		goto out_put_ctx;
 	}
 
 	/* Allocate a proper link for this ctx */
@@ -429,11 +454,18 @@ int bpf_fault_ops_link_claim(union bpf_attr *attr)
 	ctx->parent_link_id = 0;
 
 	bpf_link_put(parent_link);
+	/*
+	 * new_link now owns the context's original reference; drop the one
+	 * bpf_fault_find_inherited_ctx() took for us.
+	 */
+	bpf_fault_ctx_put(ctx);
 	return bpf_link_settle(&primer);
 
 out_unclaim:
 	/* Restore inherited so cleanup paths and retries still work */
 	WRITE_ONCE(ctx->inherited, 1);
+out_put_ctx:
+	bpf_fault_ctx_put(ctx);
 out_put_parent:
 	kfree(new_link);
 	bpf_link_put(parent_link);
