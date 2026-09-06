@@ -135,8 +135,30 @@ static void bpf_fault_ctx_get(struct bpf_fault_ctx *ctx)
 
 void bpf_fault_ctx_put(struct bpf_fault_ctx *ctx)
 {
+	if (!ctx)
+		return;
 	if (refcount_dec_and_test(&ctx->refcount))
 		bpf_fault_ctx_free(ctx);
+}
+
+/*
+ * Did the PTE keep mapping the folio the BPF program was shown?
+ *
+ * A NULL expectation means the program was handed no page (nothing was
+ * mapped when we looked), in which case there is nothing to compare and
+ * the existing present/uffd-wp checks are all the caller can rely on.
+ */
+static bool bpf_fault_same_folio(struct vm_area_struct *vma,
+				 unsigned long address, pte_t pte,
+				 struct folio *expected)
+{
+	struct page *page;
+
+	if (!expected)
+		return true;
+
+	page = vm_normal_page(vma, address, pte);
+	return page && page_folio(page) == expected;
 }
 
 /*
@@ -241,7 +263,7 @@ out_no_page:
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
-	if (ops->handle_wp_fault)
+	if (ops && ops->handle_wp_fault)
 		err = ops->handle_wp_fault(&ops_ctx, kaddr);
 	else
 		err = -ENOSYS;
@@ -291,7 +313,18 @@ out_no_page:
 			goto out_unlock;
 
 		pte = ptep_get(ptep);
-		if (pte_present(pte) && pte_uffd_wp(pte)) {
+		/*
+		 * The fault lock was dropped while the BPF program ran, so
+		 * the mapping may have changed underneath us (COW, migration,
+		 * reclaim).  Resolving the write protection for a folio the
+		 * program never saw would let the write through without the
+		 * handler having observed that page, so only clear the marker
+		 * when the mapping still refers to the same folio.  Otherwise
+		 * retry: the fault re-runs and re-invokes the handler against
+		 * the current contents.
+		 */
+		if (pte_present(pte) && pte_uffd_wp(pte) &&
+		    bpf_fault_same_folio(vma, address, pte, folio)) {
 			pte = pte_clear_uffd_wp(pte);
 			set_pte_at(mm, address, ptep, pte);
 		}
@@ -433,7 +466,10 @@ vm_fault_t handle_bpf_fault(struct vm_fault *vmf, bool can_complete)
 
 	rcu_read_lock();
 	ops = bpf_fault_ops_map(ctx->prog);
-	err = ops->handle_page_fault(&ops_ctx, kaddr);
+	if (ops && ops->handle_page_fault)
+		err = ops->handle_page_fault(&ops_ctx, kaddr);
+	else
+		err = -ENOSYS;
 	rcu_read_unlock();
 
 	kunmap_local(kaddr);
@@ -606,8 +642,9 @@ struct bpf_fault_ctx *bpf_fault_ctx_alloc_for_mm(struct mm_struct *mm,
 
 /*
  * Find an inherited bpf_fault_ctx in the given mm that was forked from
- * the parent link with the specified ID.  Returns the ctx with the
- * mmap read lock released, or NULL if not found.
+ * the parent link with the specified ID.  Returns the ctx with a
+ * reference held and the mmap read lock released, or NULL if not found.
+ * The caller must drop the reference with bpf_fault_ctx_put().
  */
 struct bpf_fault_ctx *bpf_fault_find_inherited_ctx(struct mm_struct *mm,
 						   u32 parent_link_id)
@@ -625,6 +662,11 @@ struct bpf_fault_ctx *bpf_fault_find_inherited_ctx(struct mm_struct *mm,
 		ctx = vma->vm_userfaultfd_ctx.bpf_ctx;
 		if (ctx && ctx->inherited &&
 		    ctx->parent_link_id == parent_link_id) {
+			/*
+			 * Take a reference before dropping the lock: the
+			 * caller dereferences the ctx after it returns.
+			 */
+			bpf_fault_ctx_get(ctx);
 			mmap_read_unlock(mm);
 			return ctx;
 		}
